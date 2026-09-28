@@ -9,14 +9,19 @@ on:
 env:
   ANDROID_HOME: /usr/local/lib/android/sdk
   ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
   NDK_VERSION: "28.1.13356709"
   CMAKE_VERSION: "3.22.1"
+
   GLSLC: /usr/local/lib/android/sdk/ndk/28.1.13356709/shader-tools/linux-x86_64/glslc
+
   VOICESKIP_COMMIT: "5450da4ad59ddbaedfceabb600d11d1799b69862"
+
   MODEL_HF_COMMIT: "98aa99a0a9db05ae2342309f5096248665f7cba3"
   MODEL_FILE: "ggml-large-v3-turbo-q5_0.bin"
   MODEL_SIZE: "574041195"
   MODEL_SHA256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+
   VAD_FILE: "ggml-silero-v6.2.0.bin"
   VAD_SIZE: "885098"
   VAD_SHA256: "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
@@ -29,6 +34,8 @@ jobs:
     steps:
       - name: Fetch pinned VoiceSkip source
         run: |
+          set -euo pipefail
+
           git lfs version
 
           mkdir source
@@ -36,16 +43,34 @@ jobs:
 
           git init
           git remote add origin https://github.com/tguillem/VoiceSkip.git
-          git fetch --depth 1 origin "$VOICESKIP_COMMIT"
+
+          git fetch \
+            --depth 1 \
+            origin "$VOICESKIP_COMMIT"
+
           git checkout --detach FETCH_HEAD
 
-          test "$(git rev-parse HEAD)" = "$VOICESKIP_COMMIT"
+          ACTUAL_COMMIT="$(git rev-parse HEAD)"
+
+          echo "Expected VoiceSkip commit: $VOICESKIP_COMMIT"
+          echo "Actual VoiceSkip commit:   $ACTUAL_COMMIT"
+
+          test "$ACTUAL_COMMIT" = "$VOICESKIP_COMMIT"
 
           VAD="models_pack/src/main/assets/models/$VAD_FILE"
 
           test -s "$VAD"
-          test "$(stat -c%s "$VAD")" = "$VAD_SIZE"
+
+          ACTUAL_VAD_SIZE="$(stat -c%s "$VAD")"
+
+          echo "Expected VAD size: $VAD_SIZE"
+          echo "Actual VAD size:   $ACTUAL_VAD_SIZE"
+
+          test "$ACTUAL_VAD_SIZE" = "$VAD_SIZE"
+
           echo "$VAD_SHA256  $VAD" | sha256sum -c -
+
+          echo "Pinned VoiceSkip source and VAD verified"
 
       - name: Set up Java 17
         uses: actions/setup-java@v5
@@ -55,6 +80,8 @@ jobs:
 
       - name: Install Android SDK / NDK / CMake
         run: |
+          set -euo pipefail
+
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
 
           test -x "$SDKMANAGER"
@@ -69,6 +96,8 @@ jobs:
 
       - name: Toolchain preflight
         run: |
+          set -euo pipefail
+
           CMAKE="$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION/bin/cmake"
           NINJA="$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION/bin/ninja"
           CLANG="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
@@ -78,10 +107,19 @@ jobs:
           test -x "$CLANG"
           test -x "$GLSLC"
 
+          echo "JAVA:"
           java -version
+
+          echo "CMAKE:"
           "$CMAKE" --version
+
+          echo "NINJA:"
           "$NINJA" --version
+
+          echo "CLANG:"
           "$CLANG" --version
+
+          echo "GLSLC:"
           "$GLSLC" --version
 
           cat > /tmp/voiceskip-test.comp <<'EOF'
@@ -98,6 +136,8 @@ jobs:
 
           test -s /tmp/voiceskip-test.spv
 
+          echo "Toolchain and Vulkan shader compiler OK"
+
       - name: Patch VoiceSkip for Galaxy Z Fold7
         shell: python
         run: |
@@ -107,10 +147,16 @@ jobs:
           root = Path("source")
           glslc = os.environ["GLSLC"]
 
+          # ---------------------------------------------------------
+          # Adreno 830:
+          # allow Vulkan on Galaxy Z Fold7 while retaining upstream
+          # blocking for other Adreno generations, Xclipse, PowerVR.
+          # ---------------------------------------------------------
+
           jni = root / "lib/src/main/jni/jni.c"
           text = jni.read_text()
 
-          old = '''static bool
+          old_gpu = '''static bool
           is_gpu_blocklisted(const char *desc)
           {
               /* Adreno 6xx-7xx series (tested until 730) cause VK_ERROR_DEVICE_LOST or
@@ -125,7 +171,7 @@ jobs:
           }
           '''
 
-          new = '''static bool
+          new_gpu = '''static bool
           is_gpu_blocklisted(const char *desc)
           {
               const bool is_adreno_830 =
@@ -140,100 +186,165 @@ jobs:
           }
           '''
 
-          if old not in text:
+          if old_gpu not in text:
               raise SystemExit("GPU blocklist anchor not found")
 
-          jni.write_text(text.replace(old, new, 1))
+          text = text.replace(old_gpu, new_gpu, 1)
 
-          pref = root / "app/src/main/java/com/voiceskip/data/UserPreferences.kt"
+          if "is_adreno_830" not in text:
+              raise SystemExit("Adreno 830 patch verification failed")
+
+          jni.write_text(text)
+
+          # ---------------------------------------------------------
+          # Russian transcription by default.
+          # ---------------------------------------------------------
+
+          pref = (
+              root
+              / "app/src/main/java/com/voiceskip/data/UserPreferences.kt"
+          )
+
           text = pref.read_text()
 
-          old_lang = 'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_AUTO'
-          new_lang = 'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_RUSSIAN'
+          old_lang = (
+              'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_AUTO'
+          )
+
+          new_lang = (
+              'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_RUSSIAN'
+          )
 
           if old_lang not in text:
-              raise SystemExit("Default-language anchor not found")
+              raise SystemExit("Default language anchor not found")
 
-          pref.write_text(text.replace(old_lang, new_lang, 1))
+          text = text.replace(old_lang, new_lang, 1)
+
+          if new_lang not in text:
+              raise SystemExit("Russian default verification failed")
+
+          pref.write_text(text)
+
+          # ---------------------------------------------------------
+          # Explicit glslc path for ggml Vulkan CMake.
+          # ---------------------------------------------------------
 
           lib_gradle = root / "lib/build.gradle"
           text = lib_gradle.read_text()
 
-          old_args = 'arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"'
-          new_args = (
+          old_cmake = (
+              'arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"'
+          )
+
+          new_cmake = (
               'arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",\n'
               f'                         "-DVulkan_GLSLC_EXECUTABLE={glslc}"'
           )
 
-          if old_args not in text:
-              raise SystemExit("CMake-arguments anchor not found")
+          if old_cmake not in text:
+              raise SystemExit("CMake arguments anchor not found")
 
-          lib_gradle.write_text(text.replace(old_args, new_args, 1))
+          text = text.replace(old_cmake, new_cmake, 1)
+
+          if "Vulkan_GLSLC_EXECUTABLE=" not in text:
+              raise SystemExit("glslc CMake patch verification failed")
+
+          lib_gradle.write_text(text)
+
+          # ---------------------------------------------------------
+          # Separate Android package ID so original VoiceSkip and
+          # VoiceSkip Fold7 can coexist on the phone.
+          # ---------------------------------------------------------
 
           app_gradle = root / "app/build.gradle"
           text = app_gradle.read_text()
 
-          if 'applicationId "com.voiceskip"' not in text:
-              raise SystemExit("Application-ID anchor not found")
+          old_app_id = 'applicationId "com.voiceskip"'
+          new_app_id = 'applicationId "com.voiceskip.fold7"'
 
-          text = text.replace(
-              'applicationId "com.voiceskip"',
-              'applicationId "com.voiceskip.fold7"',
-              1
-          )
+          if old_app_id not in text:
+              raise SystemExit("Application ID anchor not found")
 
-          if 'versionName "1.0.7"' not in text:
-              raise SystemExit("Version-name anchor not found")
+          text = text.replace(old_app_id, new_app_id, 1)
 
-          text = text.replace(
-              'versionName "1.0.7"',
-              'versionName "1.0.7-fold7"',
-              1
-          )
+          old_version = 'versionName "1.0.7"'
+          new_version = 'versionName "1.0.7-fold7"'
+
+          if old_version not in text:
+              raise SystemExit("Version name anchor not found")
+
+          text = text.replace(old_version, new_version, 1)
+
+          if new_app_id not in text:
+              raise SystemExit("Application ID verification failed")
+
+          if new_version not in text:
+              raise SystemExit("Version verification failed")
 
           app_gradle.write_text(text)
 
+          # ---------------------------------------------------------
+          # Visible app name + model label.
+          #
+          # We deliberately patch strings.xml, not Kotlin UI logic.
+          # With only one bundled Whisper model it is displayed as
+          # "Optimal for Fold7".
+          # ---------------------------------------------------------
+
           strings = root / "app/src/main/res/values/strings.xml"
           text = strings.read_text()
-          old_name = '<string name="app_name">VoiceSkip</string>'
 
-          if old_name not in text:
-              raise SystemExit("App-name anchor not found")
-
-          strings.write_text(
-              text.replace(
-                  old_name,
-                  '<string name="app_name">VoiceSkip Fold7</string>',
-                  1
-              )
+          old_app_name = (
+              '<string name="app_name">VoiceSkip</string>'
           )
 
-          settings = root / "app/src/main/java/com/voiceskip/ui/settings/SettingsScreen.kt"
-          text = settings.read_text()
+          new_app_name = (
+              '<string name="app_name">VoiceSkip Fold7</string>'
+          )
 
-          old_label = '''        return when (bundled.indexOfFirst { it.id == info.id }) {
-              0 -> labelFaster
-              bundled.lastIndex -> labelPrecise
-              else -> labelBalanced
-          }'''
+          if old_app_name not in text:
+              raise SystemExit("App name anchor not found")
 
-          new_label = '''        if (bundled.size == 1) return labelPrecise
-          return when (bundled.indexOfFirst { it.id == info.id }) {
-              0 -> labelFaster
-              bundled.lastIndex -> labelPrecise
-              else -> labelBalanced
-          }'''
+          text = text.replace(
+              old_app_name,
+              new_app_name,
+              1
+          )
 
-          if old_label not in text:
-              raise SystemExit("Single-model label anchor not found")
+          old_fast_label = (
+              '<string name="settings_model_faster">Faster</string>'
+          )
 
-          settings.write_text(text.replace(old_label, new_label, 1))
+          new_fast_label = (
+              '<string name="settings_model_faster">'
+              'Optimal for Fold7'
+              '</string>'
+          )
 
-          print("All Fold7 source patches applied")
+          if old_fast_label not in text:
+              raise SystemExit("Model label string anchor not found")
+
+          text = text.replace(
+              old_fast_label,
+              new_fast_label,
+              1
+          )
+
+          if new_app_name not in text:
+              raise SystemExit("App name verification failed")
+
+          if "Optimal for Fold7" not in text:
+              raise SystemExit("Model label verification failed")
+
+          strings.write_text(text)
+
+          print("All Fold7 source patches applied and verified")
 
       - name: Native Vulkan build preflight
         working-directory: source
         run: |
+          set -euo pipefail
+
           chmod +x gradlew
 
           ./gradlew \
@@ -242,8 +353,36 @@ jobs:
             -PtargetAbi=arm64-v8a \
             :lib:assembleDebug
 
+          find lib/build \
+            -type f \
+            \( \
+              -name "libggml-vulkan.so" \
+              -o -name "libwhisper.so" \
+            \) \
+            -print
+
+          test -n "$(
+            find lib/build \
+              -type f \
+              -name "libggml-vulkan.so" \
+              -print \
+              -quit
+          )"
+
+          test -n "$(
+            find lib/build \
+              -type f \
+              -name "libwhisper.so" \
+              -print \
+              -quit
+          )"
+
+          echo "Native Vulkan build preflight OK"
+
       - name: Install pinned Large-v3-turbo q5_0 model
         run: |
+          set -euo pipefail
+
           MODEL_DIR="source/models_pack/src/main/assets/models"
           MODEL="$MODEL_DIR/$MODEL_FILE"
 
@@ -260,14 +399,24 @@ jobs:
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/$MODEL_HF_COMMIT/$MODEL_FILE"
 
           test -s "$MODEL"
-          test "$(stat -c%s "$MODEL")" = "$MODEL_SIZE"
+
+          ACTUAL_MODEL_SIZE="$(stat -c%s "$MODEL")"
+
+          echo "Expected model size: $MODEL_SIZE"
+          echo "Actual model size:   $ACTUAL_MODEL_SIZE"
+
+          test "$ACTUAL_MODEL_SIZE" = "$MODEL_SIZE"
+
           echo "$MODEL_SHA256  $MODEL" | sha256sum -c -
 
-          ls -lh "$MODEL"
+          echo "Installed models:"
+          ls -lh "$MODEL_DIR"
 
       - name: Build Fold7 arm64 APK
         working-directory: source
         run: |
+          set -euo pipefail
+
           ./gradlew \
             --no-daemon \
             --stacktrace \
@@ -276,29 +425,59 @@ jobs:
 
       - name: Verify and stage APK
         run: |
+          set -euo pipefail
+
           mkdir -p out
 
-          APK=$(
+          APK="$(
             find source/app/build/outputs/apk/debug \
               -type f \
               -name "*.apk" \
-              | head -1
-          )
+              -print \
+              -quit
+          )"
 
           test -n "$APK"
           test -s "$APK"
 
-          unzip -l "$APK" | grep -F "assets/models/$MODEL_FILE"
-          unzip -l "$APK" | grep -F "assets/models/$VAD_FILE"
-          unzip -l "$APK" | grep -F "lib/arm64-v8a/libggml-vulkan.so"
-          unzip -l "$APK" | grep -F "lib/arm64-v8a/libwhisper.so"
+          echo "Built APK:"
+          ls -lh "$APK"
+
+          echo "Checking Large-v3-turbo model..."
+          unzip -l "$APK" \
+            | grep -F "assets/models/$MODEL_FILE"
+
+          echo "Checking Silero VAD..."
+          unzip -l "$APK" \
+            | grep -F "assets/models/$VAD_FILE"
+
+          echo "Checking Vulkan backend..."
+          unzip -l "$APK" \
+            | grep -F "lib/arm64-v8a/libggml-vulkan.so"
+
+          echo "Checking Whisper native library..."
+          unzip -l "$APK" \
+            | grep -F "lib/arm64-v8a/libwhisper.so"
+
+          echo "Checking no weak bundled Whisper models remain..."
+
+          if unzip -l "$APK" \
+            | grep -E \
+              'assets/models/ggml-(base|small|medium)-'; then
+            echo "Unexpected weaker Whisper model found in APK"
+            exit 1
+          fi
 
           FINAL="out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk"
 
           cp "$APK" "$FINAL"
+
           sha256sum "$FINAL" > "$FINAL.sha256"
 
+          echo "Final APK:"
           ls -lh "$FINAL" "$FINAL.sha256"
+
+          echo "APK SHA256:"
           cat "$FINAL.sha256"
 
       - name: Upload APK
