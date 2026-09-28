@@ -340,6 +340,258 @@ jobs:
 
           print("All Fold7 source patches applied and verified")
 
+          # Fold7 compatibility profile: set before ggml enumerates/initializes Vulkan.
+          jni = root / 'lib/src/main/jni/jni.c'
+          text = jni.read_text()
+          def replace_once(text, old, new):
+              if text.count(old) != 1:
+                  raise SystemExit('Patch anchor must occur once: ' + old[:100])
+              return text.replace(old, new, 1)
+          text = replace_once(text, '// #define EXTRA_LOGS', '#define EXTRA_LOGS')
+          text = replace_once(text, 'static jclass g_class_illegal_state;', '''/* Vulkan writes shader/driver failures to stderr, bypassing whisper_log_set.
+           * Route that stream into our own process log so the in-app report can retain it. */
+          static void *fold7_stderr_reader(void *opaque)
+          {
+              FILE *input = fdopen((int)(intptr_t)opaque, "r");
+              if (!input) { close((int)(intptr_t)opaque); return NULL; }
+              char line[1024];
+              while (fgets(line, sizeof line, input))
+                  __android_log_write(ANDROID_LOG_WARN, "Fold7Native", line);
+              fclose(input);
+              return NULL;
+          }
+
+          static void fold7_capture_stderr(void)
+          {
+              int fds[2];
+              if (pipe(fds) != 0) return;
+              pthread_t thread;
+              if (pthread_create(&thread, NULL, fold7_stderr_reader, (void *)(intptr_t)fds[0]) != 0)
+              {
+                  close(fds[0]); close(fds[1]); return;
+              }
+              pthread_detach(thread);
+              dup2(fds[1], STDERR_FILENO);
+              close(fds[1]);
+          }
+
+          static jclass g_class_illegal_state;''')
+          text = replace_once(text, '#include <stdatomic.h>', '#include <stdatomic.h>\n#include <stdint.h>')
+          text = replace_once(text, '    whisper_log_set(whisper_android_log_callback, NULL);', '''    /* Conservative profile for the Fold7 build, before Vulkan module loading.
+               * These are real runtime controls in pinned ggml, not unused CMake flags. */
+              setenv("GGML_VK_DISABLE_COOPMAT", "1", 1);
+              setenv("GGML_VK_DISABLE_COOPMAT2", "1", 1);
+              setenv("GGML_VK_DISABLE_F16", "1", 1);
+              setenv("GGML_VK_DISABLE_INTEGER_DOT_PRODUCT", "1", 1);
+              setenv("GGML_VK_DISABLE_FUSION", "1", 1);
+              setenv("GGML_VK_DISABLE_ASYNC", "1", 1);
+              fold7_capture_stderr();
+              whisper_log_set(whisper_android_log_callback, NULL);
+              LOGI("Fold7 compatibility-v2: FP32, no coopmat/int-dot/fusion/async/flash-attention");''')
+          text = replace_once(text, '    cparams.flash_attn = cparams.use_gpu = use_gpu;', '''    cparams.use_gpu = use_gpu;
+              cparams.flash_attn = false;''')
+          text = replace_once(text, 'whisper_full_default_params(WHISPER_SAMPLING_GREEDY);', 'whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);')
+          text = replace_once(text, '    wparams.suppress_nst = true;', '''    wparams.suppress_nst = true;
+              wparams.beam_search.beam_size = 5;''')
+          jni.write_text(text)
+
+          # Respect the PCM format produced by MediaCodec, including format changes.
+          audio = root / 'app/src/main/java/com/voiceskip/media/FileAudioProvider.kt'
+          text = audio.read_text()
+          text = replace_once(text, 'import android.media.MediaCodec', 'import android.media.AudioFormat\nimport android.media.MediaCodec')
+          text = replace_once(text, '            var outputEOS = false', '''            var outputEOS = false
+                      var outputRate = trackInfo.sampleRate
+                      var outputChannels = trackInfo.channels
+                      var outputEncoding = AudioFormat.ENCODING_PCM_16BIT''')
+          text = replace_once(text, '                if (outputIndex >= 0) {', '''                if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                              val format = decoder!!.outputFormat
+                              outputRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                              outputChannels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                              outputEncoding = if (format.containsKey(MediaFormat.KEY_PCM_ENCODING))
+                                  format.getInteger(MediaFormat.KEY_PCM_ENCODING)
+                              else AudioFormat.ENCODING_PCM_16BIT
+                              Log.i("Fold7Audio", "PCM rate=$outputRate channels=$outputChannels encoding=$outputEncoding")
+                          }
+                          if (outputIndex >= 0) {''')
+          text = replace_once(text, '                            outputBuffer.get(pcmData)', '''                            outputBuffer.position(inputBufferInfo.offset)
+                                      outputBuffer.limit(inputBufferInfo.offset + inputBufferInfo.size)
+                                      outputBuffer.get(pcmData)''')
+          text = replace_once(text, 'pcmData, trackInfo.channels, trackInfo.sampleRate', 'pcmData, outputChannels, outputRate, outputEncoding')
+          start = text.index('        sourceSampleRate: Int\n')
+          end = text.index('        return if (sourceSampleRate', start)
+          text = text[:start] + '''        sourceSampleRate: Int,
+                  encoding: Int
+              ): FloatArray {
+                  require(channels > 0 && sourceSampleRate > 0)
+                  val data = ByteBuffer.wrap(pcmData).order(ByteOrder.LITTLE_ENDIAN)
+                  val bytesPerSample = when (encoding) {
+                      AudioFormat.ENCODING_PCM_16BIT -> 2
+                      AudioFormat.ENCODING_PCM_FLOAT, AudioFormat.ENCODING_PCM_32BIT -> 4
+                      AudioFormat.ENCODING_PCM_24BIT_PACKED -> 3
+                      AudioFormat.ENCODING_PCM_8BIT -> 1
+                      else -> error("Unsupported PCM encoding: $encoding")
+                  }
+                  val monoSamples = FloatArray(pcmData.size / (bytesPerSample * channels)) {
+                      var sum = 0f
+                      repeat(channels) {
+                          val sample = when (encoding) {
+                              AudioFormat.ENCODING_PCM_FLOAT -> data.float
+                              AudioFormat.ENCODING_PCM_32BIT -> data.int / 2147483648f
+                              AudioFormat.ENCODING_PCM_24BIT_PACKED -> {
+                                  val value = (data.get().toInt() and 255) or
+                                      ((data.get().toInt() and 255) shl 8) or
+                                      (data.get().toInt() shl 16)
+                                  value / 8388608f
+                              }
+                              AudioFormat.ENCODING_PCM_8BIT -> ((data.get().toInt() and 255) - 128) / 128f
+                              else -> data.short / 32768f
+                          }
+                          sum += if (sample.isFinite()) sample.coerceIn(-1f, 1f) else 0f
+                      }
+                      sum / channels
+                  }
+
+          ''' + text[end:]
+          text = replace_once(text, '    private fun convertPcmToFloat(', '    internal fun convertPcmToFloat(')
+          audio.write_text(text)
+
+          test = root / 'app/src/test/java/com/voiceskip/media/Fold7PcmTest.kt'
+          test.parent.mkdir(parents=True, exist_ok=True)
+          test.write_text('''package com.voiceskip.media
+
+          import android.media.AudioFormat
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.ByteOrder
+          import org.junit.Assert.assertArrayEquals
+          import org.junit.Test
+
+          class Fold7PcmTest {
+              private val provider = FileAudioProvider(file = File("unused-test-input"))
+
+              @Test fun floatStereoIsNotInterpretedAsInt16() {
+                  val data = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+                      .putFloat(0.5f).putFloat(0.25f).putFloat(-1f).putFloat(1f).array()
+                  assertArrayEquals(floatArrayOf(0.375f, 0f),
+                      provider.convertPcmToFloat(data, 2, 16000, AudioFormat.ENCODING_PCM_FLOAT), 0.00001f)
+              }
+
+              @Test fun int16PreservesFullNegativeRange() {
+                  val data = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+                      .putShort((-32768).toShort()).putShort(16384.toShort()).array()
+                  assertArrayEquals(floatArrayOf(-1f, 0.5f),
+                      provider.convertPcmToFloat(data, 1, 16000, AudioFormat.ENCODING_PCM_16BIT), 0.00001f)
+              }
+
+              @Test fun packed24BitSignIsPreserved() {
+                  val data = byteArrayOf(0, 0, 0x80.toByte(), 0, 0, 0x40)
+                  assertArrayEquals(floatArrayOf(-1f, 0.5f),
+                      provider.convertPcmToFloat(data, 1, 16000, AudioFormat.ENCODING_PCM_24BIT_PACKED), 0.00001f)
+              }
+
+              @Test fun invalidFloatSamplesCannotPoisonModel() {
+                  val data = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
+                      .putFloat(Float.NaN).putFloat(Float.POSITIVE_INFINITY).array()
+                  assertArrayEquals(floatArrayOf(0f, 0f),
+                      provider.convertPcmToFloat(data, 1, 16000, AudioFormat.ENCODING_PCM_FLOAT), 0f)
+              }
+          }
+          ''')
+
+          app_gradle = root / 'app/build.gradle'
+          text = app_gradle.read_text().replace('versionCode 20', 'versionCode 21').replace('1.0.7-fold7"', '1.0.7-fold7-compat2"')
+          app_gradle.write_text(text)
+          # CI's old debug signing key was ephemeral. Install alongside the old app
+          # so testing never requires deleting the user's recordings or settings.
+          text = app_gradle.read_text().replace('applicationId "com.voiceskip.fold7"', 'applicationId "com.voiceskip.fold7.compat2"')
+          app_gradle.write_text(text)
+          strings = root / 'app/src/main/res/values/strings.xml'
+          strings.write_text(strings.read_text().replace('>VoiceSkip Fold7</string>', '>VoiceSkip Fold7 2</string>'))
+
+          diagnostics = root / 'app/src/main/java/com/voiceskip/ui/settings/Fold7Diagnostics.kt'
+          diagnostics.write_text('''package com.voiceskip.ui.settings
+
+          import android.os.Build
+          import android.os.Process
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import com.voiceskip.BuildConfig
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.util.concurrent.TimeUnit
+
+          @Composable
+          fun Fold7Diagnostics() {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var report by remember { mutableStateOf<String?>(null) }
+              var busy by remember { mutableStateOf(false) }
+              var status by remember { mutableStateOf("") }
+              val save = rememberLauncherForActivityResult(
+                  ActivityResultContracts.CreateDocument("text/plain")
+              ) { uri ->
+                  val text = report
+                  if (uri != null && text != null) scope.launch {
+                      status = withContext(Dispatchers.IO) {
+                          runCatching {
+                              requireNotNull(context.contentResolver.openOutputStream(uri)).bufferedWriter().use { it.write(text) }
+                              "Отчёт сохранён"
+                          }.getOrElse { "Не удалось сохранить отчёт: ${it.javaClass.simpleName}" }
+                      }
+                  }
+              }
+              TextButton(enabled = !busy, onClick = {
+                  busy = true
+                  scope.launch {
+                      report = withContext(Dispatchers.IO) {
+                          val header = "VoiceSkip ${BuildConfig.VERSION_NAME}\\n" +
+                              "${Build.MANUFACTURER} ${Build.MODEL}; Android ${Build.VERSION.RELEASE}; ${Build.HARDWARE}\\n" +
+                              "Profile: Vulkan FP32; flash/coopmat/int-dot/fusion/async disabled; beam=5\\n"
+                          header + runCatching {
+                              val log = java.lang.ProcessBuilder("logcat", "-d", "-t", "1200", "--pid=${Process.myPid()}",
+                                  "-v", "brief", "JNI:I", "whisper_guard:V", "whisper:V", "ggml:V", "Fold7Native:V", "Fold7Audio:I", "*:S")
+                                  .redirectErrorStream(true).start()
+                              // Drain while the process runs, with a bounded wait on a separate watchdog.
+                              val watchdog = Thread {
+                                  if (!log.waitFor(4, TimeUnit.SECONDS)) log.destroy()
+                              }.apply { isDaemon = true; start() }
+                              val lines = log.inputStream.bufferedReader().use { it.readText().takeLast(48000) }
+                              watchdog.join(4500)
+                              // Keep engine status/errors only; never include transcription text.
+                              lines.lineSequence().filter { line ->
+                                  listOf("GPU", "gpu", "Vulkan", "vulkan", "exception", "failed", "Failed",
+                                      "error", "Error", "backend", "buffer", "memory", "Starting stream", "PCM rate", "compatibility-v2")
+                                      .any { line.contains(it) }
+                              }.map { it.replace(Regex("/[^\\\\s]+"), "[path]") }
+                                  .take(160).joinToString("\\n").ifBlank { "Нет записей движка. Повторите ошибку и откройте отчёт в этом же сеансе." }
+                          }.getOrElse { "Не удалось прочитать журнал: ${it.javaClass.simpleName}" }
+                      }
+                      busy = false
+                  }
+              }) { Text(if (busy) "Подготовка отчёта…" else "Диагностика GPU и звука") }
+              if (status.isNotEmpty()) Text(status)
+              report?.let { text ->
+                  AlertDialog(onDismissRequest = { report = null },
+                      title = { Text("Диагностика Fold7") },
+                      text = { Text(text, modifier = Modifier.verticalScroll(rememberScrollState())) },
+                      confirmButton = { TextButton(onClick = { save.launch("VoiceSkip-Fold7-diagnostics.txt") }) { Text("Сохранить файл") } },
+                      dismissButton = { TextButton(onClick = { report = null }) { Text("Закрыть") } })
+              }
+          }
+          ''')
+          about = root / 'app/src/main/java/com/voiceskip/ui/settings/AboutSection.kt'
+          text = about.read_text()
+          text = replace_once(text, '            AboutItemMultiline(', '            Fold7Diagnostics()\n\n            AboutItemMultiline(')
+          about.write_text(text)
+
       - name: Native Vulkan build preflight
         working-directory: source
         run: |
@@ -411,6 +663,10 @@ jobs:
 
           echo "Installed models:"
           ls -lh "$MODEL_DIR"
+
+      - name: Run JVM tests
+        working-directory: source
+        run: ./gradlew --no-daemon -PtargetAbi=arm64-v8a :app:testDebugUnitTest
 
       - name: Build Fold7 arm64 APK
         working-directory: source
