@@ -32,9 +32,11 @@ jobs:
           export ANDROID_HOME=/usr/local/lib/android/sdk
           export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
 
-          yes | sdkmanager --licenses >/dev/null || true
+          SDKMANAGER=/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager
 
-          sdkmanager \
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
@@ -48,8 +50,6 @@ jobs:
 
           root = Path("source")
 
-          # 1. Allow Adreno 830 while preserving the upstream blocklist
-          #    for other known-problematic GPUs.
           jni = root / "lib/src/main/jni/jni.c"
           text = jni.read_text()
 
@@ -71,11 +71,6 @@ jobs:
           new = '''static bool
           is_gpu_blocklisted(const char *desc)
           {
-              /* Fold7 patch:
-               * allow Snapdragon 8 Elite / Adreno 830.
-               * Keep the upstream block for other Adreno generations,
-               * Xclipse and PowerVR.
-               */
               const bool is_adreno_830 =
                   strstr(desc, "Adreno (TM) 830") != NULL ||
                   strstr(desc, "Adreno 830") != NULL;
@@ -93,23 +88,12 @@ jobs:
 
           jni.write_text(text.replace(old, new))
 
-          # 2. Russian language by default.
           pref = root / "app/src/main/java/com/voiceskip/data/UserPreferences.kt"
           text = pref.read_text()
 
           text = text.replace(
               'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_AUTO',
               'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_RUSSIAN'
-          )
-
-          pref.write_text(text)
-
-          # 3. Make GPU enabled by default and Turbo auto-enabled by default.
-          text = pref.read_text()
-
-          text = text.replace(
-              'preferences[GPU_ENABLED_KEY] ?: true',
-              'preferences[GPU_ENABLED_KEY] ?: true'
           )
 
           text = text.replace(
@@ -119,8 +103,6 @@ jobs:
 
           pref.write_text(text)
 
-          # 4. Give this build a separate package so it can coexist
-          #    with the original VoiceSkip.
           gradle = root / "app/build.gradle"
           text = gradle.read_text()
 
@@ -136,7 +118,6 @@ jobs:
 
           gradle.write_text(text)
 
-          # 5. Rename the app visibly.
           strings = root / "app/src/main/res/values/strings.xml"
           text = strings.read_text()
 
@@ -151,7 +132,6 @@ jobs:
         run: |
           cd source/models_pack/src/main/assets/models
 
-          # Keep Silero VAD, remove weaker Whisper models.
           rm -f ggml-base-*.bin
           rm -f ggml-small-*.bin
           rm -f ggml-medium-*.bin
@@ -164,7 +144,6 @@ jobs:
             -o ggml-large-v3-turbo-q5_0.bin \
             https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
 
-          echo "Downloaded model:"
           ls -lh ggml-large-v3-turbo-q5_0.bin
 
           SIZE=$(stat -c%s ggml-large-v3-turbo-q5_0.bin)
@@ -173,11 +152,6 @@ jobs:
             echo "Model download is unexpectedly small: $SIZE bytes"
             exit 1
           fi
-
-      - name: Verify Vulkan support is present
-        run: |
-          grep -R "GGML_VULKAN" -n source | head -20 || true
-          grep -R "libggml-vulkan" -n source | head -20 || true
 
       - name: Build Fold7 arm64 APK
         working-directory: source
@@ -207,7 +181,6 @@ jobs:
 
           cp "$APK" out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk
 
-          echo "Final APK:"
           ls -lh out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk
 
       - name: Upload APK
