@@ -6,20 +6,46 @@ on:
     paths:
       - ".github/workflows/build-fold7.yml"
 
+env:
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  NDK_VERSION: "28.1.13356709"
+  CMAKE_VERSION: "3.22.1"
+  GLSLC: /usr/local/lib/android/sdk/ndk/28.1.13356709/shader-tools/linux-x86_64/glslc
+  VOICESKIP_COMMIT: "5450da4ad59ddbaedfceabb600d11d1799b69862"
+  MODEL_HF_COMMIT: "98aa99a0a9db05ae2342309f5096248665f7cba3"
+  MODEL_FILE: "ggml-large-v3-turbo-q5_0.bin"
+  MODEL_SIZE: "574041195"
+  MODEL_SHA256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+  VAD_FILE: "ggml-silero-v6.2.0.bin"
+  VAD_SIZE: "885098"
+  VAD_SHA256: "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
-      - name: Checkout build repository
-        uses: actions/checkout@v4
-
-      - name: Clone VoiceSkip
+      - name: Fetch pinned VoiceSkip source
         run: |
-          git clone --depth 1 https://github.com/tguillem/VoiceSkip.git source
+          git lfs version
+
+          mkdir source
           cd source
-          git rev-parse HEAD
+
+          git init
+          git remote add origin https://github.com/tguillem/VoiceSkip.git
+          git fetch --depth 1 origin "$VOICESKIP_COMMIT"
+          git checkout --detach FETCH_HEAD
+
+          test "$(git rev-parse HEAD)" = "$VOICESKIP_COMMIT"
+
+          VAD="models_pack/src/main/assets/models/$VAD_FILE"
+
+          test -s "$VAD"
+          test "$(stat -c%s "$VAD")" = "$VAD_SIZE"
+          echo "$VAD_SHA256  $VAD" | sha256sum -c -
 
       - name: Set up Java 17
         uses: actions/setup-java@v5
@@ -29,26 +55,57 @@ jobs:
 
       - name: Install Android SDK / NDK / CMake
         run: |
-          export ANDROID_HOME=/usr/local/lib/android/sdk
-          export ANDROID_SDK_ROOT=/usr/local/lib/android/sdk
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
 
-          SDKMANAGER=/usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager
+          test -x "$SDKMANAGER"
 
           yes | "$SDKMANAGER" --licenses >/dev/null || true
 
           "$SDKMANAGER" \
-            "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
-            "ndk;28.1.13356709" \
-            "cmake;3.22.1"
+            "ndk;$NDK_VERSION" \
+            "cmake;$CMAKE_VERSION"
+
+      - name: Toolchain preflight
+        run: |
+          CMAKE="$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION/bin/cmake"
+          NINJA="$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION/bin/ninja"
+          CLANG="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+
+          test -x "$CMAKE"
+          test -x "$NINJA"
+          test -x "$CLANG"
+          test -x "$GLSLC"
+
+          java -version
+          "$CMAKE" --version
+          "$NINJA" --version
+          "$CLANG" --version
+          "$GLSLC" --version
+
+          cat > /tmp/voiceskip-test.comp <<'EOF'
+          #version 450
+          layout(local_size_x = 1) in;
+          void main() {}
+          EOF
+
+          "$GLSLC" \
+            -fshader-stage=compute \
+            --target-env=vulkan1.2 \
+            /tmp/voiceskip-test.comp \
+            -o /tmp/voiceskip-test.spv
+
+          test -s /tmp/voiceskip-test.spv
 
       - name: Patch VoiceSkip for Galaxy Z Fold7
         shell: python
         run: |
           from pathlib import Path
+          import os
 
           root = Path("source")
+          glslc = os.environ["GLSLC"]
 
           jni = root / "lib/src/main/jni/jni.c"
           text = jni.read_text()
@@ -84,80 +141,98 @@ jobs:
           '''
 
           if old not in text:
-              raise SystemExit("GPU blocklist code not found; upstream changed")
+              raise SystemExit("GPU blocklist anchor not found")
 
-          jni.write_text(text.replace(old, new))
+          jni.write_text(text.replace(old, new, 1))
 
           pref = root / "app/src/main/java/com/voiceskip/data/UserPreferences.kt"
           text = pref.read_text()
 
-          text = text.replace(
-              'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_AUTO',
-              'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_RUSSIAN'
+          old_lang = 'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_AUTO'
+          new_lang = 'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_RUSSIAN'
+
+          if old_lang not in text:
+              raise SystemExit("Default-language anchor not found")
+
+          pref.write_text(text.replace(old_lang, new_lang, 1))
+
+          lib_gradle = root / "lib/build.gradle"
+          text = lib_gradle.read_text()
+
+          old_args = 'arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"'
+          new_args = (
+              'arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",\n'
+              f'                         "-DVulkan_GLSLC_EXECUTABLE={glslc}"'
           )
 
-          text = text.replace(
-              'preferences[TURBO_MODE_KEY] ?: false',
-              'preferences[TURBO_MODE_KEY] ?: true'
-          )
+          if old_args not in text:
+              raise SystemExit("CMake-arguments anchor not found")
 
-          pref.write_text(text)
+          lib_gradle.write_text(text.replace(old_args, new_args, 1))
 
-          gradle = root / "app/build.gradle"
-          text = gradle.read_text()
+          app_gradle = root / "app/build.gradle"
+          text = app_gradle.read_text()
+
+          if 'applicationId "com.voiceskip"' not in text:
+              raise SystemExit("Application-ID anchor not found")
 
           text = text.replace(
               'applicationId "com.voiceskip"',
-              'applicationId "com.voiceskip.fold7"'
+              'applicationId "com.voiceskip.fold7"',
+              1
           )
+
+          if 'versionName "1.0.7"' not in text:
+              raise SystemExit("Version-name anchor not found")
 
           text = text.replace(
               'versionName "1.0.7"',
-              'versionName "1.0.7-fold7"'
+              'versionName "1.0.7-fold7"',
+              1
           )
 
-          gradle.write_text(text)
+          app_gradle.write_text(text)
 
           strings = root / "app/src/main/res/values/strings.xml"
           text = strings.read_text()
+          old_name = '<string name="app_name">VoiceSkip</string>'
 
-          text = text.replace(
-              '<string name="app_name">VoiceSkip</string>',
-              '<string name="app_name">VoiceSkip Fold7</string>'
+          if old_name not in text:
+              raise SystemExit("App-name anchor not found")
+
+          strings.write_text(
+              text.replace(
+                  old_name,
+                  '<string name="app_name">VoiceSkip Fold7</string>',
+                  1
+              )
           )
 
-          strings.write_text(text)
+          settings = root / "app/src/main/java/com/voiceskip/ui/settings/SettingsScreen.kt"
+          text = settings.read_text()
 
-      - name: Replace bundled Whisper models with Large-v3-turbo q5_0
-        run: |
-          cd source/models_pack/src/main/assets/models
+          old_label = '''        return when (bundled.indexOfFirst { it.id == info.id }) {
+              0 -> labelFaster
+              bundled.lastIndex -> labelPrecise
+              else -> labelBalanced
+          }'''
 
-          rm -f ggml-base-*.bin
-          rm -f ggml-small-*.bin
-          rm -f ggml-medium-*.bin
-          rm -f ggml-large-*.bin
+          new_label = '''        if (bundled.size == 1) return labelPrecise
+          return when (bundled.indexOfFirst { it.id == info.id }) {
+              0 -> labelFaster
+              bundled.lastIndex -> labelPrecise
+              else -> labelBalanced
+          }'''
 
-          curl -L \
-            --fail \
-            --retry 5 \
-            --retry-delay 5 \
-            -o ggml-large-v3-turbo-q5_0.bin \
-            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+          if old_label not in text:
+              raise SystemExit("Single-model label anchor not found")
 
-          ls -lh ggml-large-v3-turbo-q5_0.bin
+          settings.write_text(text.replace(old_label, new_label, 1))
 
-          SIZE=$(stat -c%s ggml-large-v3-turbo-q5_0.bin)
+          print("All Fold7 source patches applied")
 
-          if [ "$SIZE" -lt 500000000 ]; then
-            echo "Model download is unexpectedly small: $SIZE bytes"
-            exit 1
-          fi
-
-      - name: Build Fold7 arm64 APK
+      - name: Native Vulkan build preflight
         working-directory: source
-        env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
-          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
         run: |
           chmod +x gradlew
 
@@ -165,27 +240,72 @@ jobs:
             --no-daemon \
             --stacktrace \
             -PtargetAbi=arm64-v8a \
+            :lib:assembleDebug
+
+      - name: Install pinned Large-v3-turbo q5_0 model
+        run: |
+          MODEL_DIR="source/models_pack/src/main/assets/models"
+          MODEL="$MODEL_DIR/$MODEL_FILE"
+
+          rm -f "$MODEL_DIR"/ggml-base-*.bin
+          rm -f "$MODEL_DIR"/ggml-small-*.bin
+          rm -f "$MODEL_DIR"/ggml-medium-*.bin
+          rm -f "$MODEL_DIR"/ggml-large-*.bin
+
+          curl -L \
+            --fail \
+            --retry 5 \
+            --retry-delay 5 \
+            -o "$MODEL" \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/$MODEL_HF_COMMIT/$MODEL_FILE"
+
+          test -s "$MODEL"
+          test "$(stat -c%s "$MODEL")" = "$MODEL_SIZE"
+          echo "$MODEL_SHA256  $MODEL" | sha256sum -c -
+
+          ls -lh "$MODEL"
+
+      - name: Build Fold7 arm64 APK
+        working-directory: source
+        run: |
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            -PtargetAbi=arm64-v8a \
             assembleDebug
 
-      - name: Find and rename APK
+      - name: Verify and stage APK
         run: |
           mkdir -p out
 
-          APK=$(find source/app/build/outputs/apk/debug -name "*.apk" | head -1)
+          APK=$(
+            find source/app/build/outputs/apk/debug \
+              -type f \
+              -name "*.apk" \
+              | head -1
+          )
 
-          if [ -z "$APK" ]; then
-            echo "APK not found"
-            find source -type f | grep -E '\.apk$' || true
-            exit 1
-          fi
+          test -n "$APK"
+          test -s "$APK"
 
-          cp "$APK" out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk
+          unzip -l "$APK" | grep -F "assets/models/$MODEL_FILE"
+          unzip -l "$APK" | grep -F "assets/models/$VAD_FILE"
+          unzip -l "$APK" | grep -F "lib/arm64-v8a/libggml-vulkan.so"
+          unzip -l "$APK" | grep -F "lib/arm64-v8a/libwhisper.so"
 
-          ls -lh out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk
+          FINAL="out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk"
+
+          cp "$APK" "$FINAL"
+          sha256sum "$FINAL" > "$FINAL.sha256"
+
+          ls -lh "$FINAL" "$FINAL.sha256"
+          cat "$FINAL.sha256"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: VoiceSkip-Fold7-APK
-          path: out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk
+          path: |
+            out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk
+            out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk.sha256
           retention-days: 30
