@@ -142,8 +142,10 @@ object Audio {
             codec.configure(format, null, null, 0); codec.start()
             val info = MediaCodec.BufferInfo()
             var inputEnd = false; var outputEnd = false
-            var inputIndex = 0L; var targetIndex = 0L; var previous = 0f; var count = 0L
+            var inputIndex = 0L; var count = 0L
             DataOutputStream(BufferedOutputStream(FileOutputStream(output))).use { sink ->
+                fun writeSample(value:Float) { sink.writeFloat(value);count++;require(count<=2L*60*60*16000){"Запись длиннее двух часов"} }
+                var resampler=Resampler(rate,output=::writeSample)
                 while (!outputEnd) {
                     check(!cancelled()) { "Обработка отменена" }
                     if (!inputEnd) {
@@ -160,6 +162,7 @@ object Audio {
                         val f=codec.outputFormat
                         val newRate=f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
                         require(inputIndex==0L || rate==newRate) { "Частота звука меняется внутри файла" }
+                        if(newRate!=rate)resampler=Resampler(newRate,output=::writeSample)
                         rate=newRate;channels=f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                         encoding=if(f.containsKey(MediaFormat.KEY_PCM_ENCODING))f.getInteger(MediaFormat.KEY_PCM_ENCODING) else AudioFormat.ENCODING_PCM_16BIT
                         require(encoding==AudioFormat.ENCODING_PCM_16BIT || encoding==AudioFormat.ENCODING_PCM_FLOAT) { "Неподдерживаемая разрядность аудио" }
@@ -170,20 +173,14 @@ object Audio {
                         while(b.remaining()>=bytes*channels) {
                             var sample=0f
                             repeat(channels) { sample+=if(bytes==4)b.float else b.short/32768f };sample/=channels
-                            // Stateful interpolation: no sample loss at codec buffer boundaries.
-                            while(targetIndex*rate.toDouble()/16000 <= inputIndex) {
-                                val x=targetIndex*rate.toDouble()/16000
-                                val fraction=(x-(inputIndex-1)).coerceIn(0.0,1.0).toFloat()
-                                sink.writeFloat(previous+(sample-previous)*fraction);targetIndex++;count++
-                                require(count<=2L*60*60*16000) { "Запись длиннее двух часов" }
-                            }
-                            previous=sample;inputIndex++
+                            resampler.accept(sample);inputIndex++
                         }
                         outputEnd=info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM !=0
                         codec.releaseOutputBuffer(index,false)
                         if(duration>0)progress("Подготовка аудио: ${(info.presentationTimeUs*100/duration).coerceIn(0,100)}%")
                     }
                 }
+                resampler.finish()
             }
             require(count>0) { "Аудиодорожка пуста" }
         } finally { runCatching { codec?.stop() };codec?.release();extractor.release() }
@@ -351,6 +348,50 @@ class MainActivity: Activity() {
             }catch(_:Exception){}finally{track.release();if(player===track)player=null}
         }.start()
     }
+}
+''',
+
+'app/src/main/java/com/voiceskip/fold7/court/Resampler.kt': r'''package com.voiceskip.fold7.court
+
+import kotlin.math.*
+
+/** Streaming band-limited resampling; buffer boundaries never reset time or filters. */
+class Resampler(private val inputRate:Int, private val outputRate:Int=16000, private val output:(Float)->Unit) {
+    private val radius=32
+    private val ring=FloatArray(128)
+    private var received=0L
+    private var emitted=0L
+    private val kernels=Array(256) { phase ->
+        val cutoff=.94*minOf(1.0,outputRate.toDouble()/inputRate)
+        val fraction=phase/256.0
+        val weights=DoubleArray(2*radius+1) { j ->
+            val x=j-radius-fraction
+            val window=if(abs(x)>radius)0.0 else .42+.5*cos(PI*x/radius)+.08*cos(2*PI*x/radius)
+            (if(abs(x)<1e-8)cutoff else sin(PI*cutoff*x)/(PI*x))*window
+        }
+        val sum=weights.sum();FloatArray(weights.size){(weights[it]/sum).toFloat()}
+    }
+    fun accept(value:Float) {
+        if(inputRate==outputRate){output(value);received++;emitted++;return}
+        ring[(received%ring.size).toInt()]=value;received++
+        drain(false)
+    }
+    private fun drain(flush:Boolean) {
+        val target=ceil(received.toDouble()*outputRate/inputRate).toLong()
+        while(emitted<target) {
+            val at=emitted.toDouble()*inputRate/outputRate
+            val center=floor(at).toLong()
+            if(!flush && center+radius>=received)return
+            val phase=((at-center)*256).toInt().coerceIn(0,255)
+            val weights=kernels[phase];var value=0f
+            for(j in weights.indices) {
+                val index=center+j-radius
+                if(index>=0 && index<received)value+=ring[(index%ring.size).toInt()]*weights[j]
+            }
+            output(value);emitted++
+        }
+    }
+    fun finish(){if(inputRate!=outputRate)drain(true)}
 }
 ''',
 
@@ -603,6 +644,32 @@ class TranscriptionService: Service() {
         session.blocks.clear();session.blocks.addAll(Transcript.blocks(words,turns.map{it.copy(speaker=ids.getValue(it.speaker))}))
         session.complete=true;session.save(this)
     }
+}
+''',
+
+'app/src/test/java/com/voiceskip/fold7/court/ResamplerTest.kt': r'''package com.voiceskip.fold7.court
+import kotlin.math.*
+import org.junit.Assert.*
+import org.junit.Test
+
+class ResamplerTest {
+ @Test fun preservesDurationAndDcAtCommonInputRates() {
+  for(rate in listOf(16000,44100,48000)) {
+   val result=mutableListOf<Float>();val r=Resampler(rate){result.add(it)}
+   repeat(rate){r.accept(.5f)};r.finish()
+   assertEquals(16000,result.size)
+   assertEquals(.5,result.subList(100,15900).map{it.toDouble()}.average(),.002)
+  }
+ }
+ @Test fun preventsHighFrequencyAliasing() {
+  fun rms(hz:Double):Double {
+   val result=mutableListOf<Float>();val r=Resampler(48000){result.add(it)}
+   repeat(48000){r.accept(sin(2*PI*hz*it/48000).toFloat())};r.finish()
+   return sqrt(result.subList(100,15900).map{it.toDouble()*it}.average())
+  }
+  assertTrue(rms(1000.0)>.65)
+  assertTrue(rms(12000.0)<.01)
+ }
 }
 ''',
 
