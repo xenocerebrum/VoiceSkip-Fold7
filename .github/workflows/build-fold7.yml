@@ -1,746 +1,107 @@
-name: Build VoiceSkip Fold7
+name: Build VoiceSkip Fold7 GigaAM
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - ".github/workflows/build-fold7.yml"
+      - '.github/workflows/build-fold7.yml'
+      - 'build_court.py'
 
-env:
-  ANDROID_HOME: /usr/local/lib/android/sdk
-  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-
-  NDK_VERSION: "28.1.13356709"
-  CMAKE_VERSION: "3.22.1"
-
-  GLSLC: /usr/local/lib/android/sdk/ndk/28.1.13356709/shader-tools/linux-x86_64/glslc
-
-  VOICESKIP_COMMIT: "5450da4ad59ddbaedfceabb600d11d1799b69862"
-
-  MODEL_HF_COMMIT: "98aa99a0a9db05ae2342309f5096248665f7cba3"
-  MODEL_FILE: "ggml-large-v3-turbo-q5_0.bin"
-  MODEL_SIZE: "574041195"
-  MODEL_SHA256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
-
-  VAD_FILE: "ggml-silero-v6.2.0.bin"
-  VAD_SIZE: "885098"
-  VAD_SHA256: "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
-
+    timeout-minutes: 60
     steps:
-      - name: Fetch pinned VoiceSkip source
-        run: |
-          set -euo pipefail
-
-          git lfs version
-
-          mkdir source
-          cd source
-
-          git init
-          git remote add origin https://github.com/tguillem/VoiceSkip.git
-
-          git fetch \
-            --depth 1 \
-            origin "$VOICESKIP_COMMIT"
-
-          git checkout --detach FETCH_HEAD
-
-          ACTUAL_COMMIT="$(git rev-parse HEAD)"
-
-          echo "Expected VoiceSkip commit: $VOICESKIP_COMMIT"
-          echo "Actual VoiceSkip commit:   $ACTUAL_COMMIT"
-
-          test "$ACTUAL_COMMIT" = "$VOICESKIP_COMMIT"
-
-          VAD="models_pack/src/main/assets/models/$VAD_FILE"
-
-          test -s "$VAD"
-
-          ACTUAL_VAD_SIZE="$(stat -c%s "$VAD")"
-
-          echo "Expected VAD size: $VAD_SIZE"
-          echo "Actual VAD size:   $ACTUAL_VAD_SIZE"
-
-          test "$ACTUAL_VAD_SIZE" = "$VAD_SIZE"
-
-          echo "$VAD_SHA256  $VAD" | sha256sum -c -
-
-          echo "Pinned VoiceSkip source and VAD verified"
-
-      - name: Set up Java 17
-        uses: actions/setup-java@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
-
-      - name: Install Android SDK / NDK / CMake
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - name: Preserve development signing identity
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: voiceskip-court-signing-v1
+      - name: Prepare reviewed source and checksum-pinned models
+        run: python3 build_court.py
+      - name: Unit tests and ARM64 APK
+        working-directory: court
+        run: gradle --no-daemon :app:testReleaseUnitTest :app:assembleRelease
+      - name: Verify packaged models and native libraries
         run: |
-          set -euo pipefail
-
-          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-
-          test -x "$SDKMANAGER"
-
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
-
-          "$SDKMANAGER" \
-            "platforms;android-36" \
-            "build-tools;36.0.0" \
-            "ndk;$NDK_VERSION" \
-            "cmake;$CMAKE_VERSION"
-
-      - name: Toolchain preflight
-        run: |
-          set -euo pipefail
-
-          CMAKE="$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION/bin/cmake"
-          NINJA="$ANDROID_SDK_ROOT/cmake/$CMAKE_VERSION/bin/ninja"
-          CLANG="$ANDROID_SDK_ROOT/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
-
-          test -x "$CMAKE"
-          test -x "$NINJA"
-          test -x "$CLANG"
-          test -x "$GLSLC"
-
-          echo "JAVA:"
-          java -version
-
-          echo "CMAKE:"
-          "$CMAKE" --version
-
-          echo "NINJA:"
-          "$NINJA" --version
-
-          echo "CLANG:"
-          "$CLANG" --version
-
-          echo "GLSLC:"
-          "$GLSLC" --version
-
-          cat > /tmp/voiceskip-test.comp <<'EOF'
-          #version 450
-          layout(local_size_x = 1) in;
-          void main() {}
-          EOF
-
-          "$GLSLC" \
-            -fshader-stage=compute \
-            --target-env=vulkan1.2 \
-            /tmp/voiceskip-test.comp \
-            -o /tmp/voiceskip-test.spv
-
-          test -s /tmp/voiceskip-test.spv
-
-          echo "Toolchain and Vulkan shader compiler OK"
-
-      - name: Patch VoiceSkip for Galaxy Z Fold7
-        shell: python
-        run: |
+          mkdir -p deliverable
+          cp court/app/build/outputs/apk/release/app-release.apk deliverable/VoiceSkip-Fold7-GigaAM.apk
+          python3 - <<'PY'
+          import json, zipfile, hashlib, struct
           from pathlib import Path
-          import os
-
-          root = Path("source")
-          glslc = os.environ["GLSLC"]
-
-          # ---------------------------------------------------------
-          # Adreno 830:
-          # allow Vulkan on Galaxy Z Fold7 while retaining upstream
-          # blocking for other Adreno generations, Xclipse, PowerVR.
-          # ---------------------------------------------------------
-
-          jni = root / "lib/src/main/jni/jni.c"
-          text = jni.read_text()
-
-          old_gpu = '''static bool
-          is_gpu_blocklisted(const char *desc)
-          {
-              /* Adreno 6xx-7xx series (tested until 730) cause VK_ERROR_DEVICE_LOST or
-               * fail to link some shaders. Mesa/Turnip prefixes its own name onto the
-               * same silicon, so match anywhere rather than on the prefix.
-               *
-               * Xclipse and PowerVR failures can wedge both ggml and HWUI in the shared
-               * GPU driver, resulting in an application ANR. */
-              return strstr(desc, "Adreno") != NULL ||
-                     strstr(desc, "Xclipse") != NULL ||
-                     strstr(desc, "PowerVR") != NULL;
-          }
-          '''
-
-          new_gpu = '''static bool
-          is_gpu_blocklisted(const char *desc)
-          {
-              const bool is_adreno_830 =
-                  strstr(desc, "Adreno (TM) 830") != NULL ||
-                  strstr(desc, "Adreno 830") != NULL;
-
-              if (strstr(desc, "Adreno") != NULL && !is_adreno_830)
-                  return true;
-
-              return strstr(desc, "Xclipse") != NULL ||
-                     strstr(desc, "PowerVR") != NULL;
-          }
-          '''
-
-          if old_gpu not in text:
-              raise SystemExit("GPU blocklist anchor not found")
-
-          text = text.replace(old_gpu, new_gpu, 1)
-
-          if "is_adreno_830" not in text:
-              raise SystemExit("Adreno 830 patch verification failed")
-
-          jni.write_text(text)
-
-          # ---------------------------------------------------------
-          # Russian transcription by default.
-          # ---------------------------------------------------------
-
-          pref = (
-              root
-              / "app/src/main/java/com/voiceskip/data/UserPreferences.kt"
-          )
-
-          text = pref.read_text()
-
-          old_lang = (
-              'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_AUTO'
-          )
-
-          new_lang = (
-              'preferences[DEFAULT_LANGUAGE_KEY] ?: LANGUAGE_RUSSIAN'
-          )
-
-          if old_lang not in text:
-              raise SystemExit("Default language anchor not found")
-
-          text = text.replace(old_lang, new_lang, 1)
-
-          if new_lang not in text:
-              raise SystemExit("Russian default verification failed")
-
-          pref.write_text(text)
-
-          # ---------------------------------------------------------
-          # Explicit glslc path for ggml Vulkan CMake.
-          # ---------------------------------------------------------
-
-          lib_gradle = root / "lib/build.gradle"
-          text = lib_gradle.read_text()
-
-          old_cmake = (
-              'arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"'
-          )
-
-          new_cmake = (
-              'arguments "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",\n'
-              f'                         "-DVulkan_GLSLC_EXECUTABLE={glslc}"'
-          )
-
-          if old_cmake not in text:
-              raise SystemExit("CMake arguments anchor not found")
-
-          text = text.replace(old_cmake, new_cmake, 1)
-
-          if "Vulkan_GLSLC_EXECUTABLE=" not in text:
-              raise SystemExit("glslc CMake patch verification failed")
-
-          lib_gradle.write_text(text)
-
-          # ---------------------------------------------------------
-          # Separate Android package ID so original VoiceSkip and
-          # VoiceSkip Fold7 can coexist on the phone.
-          # ---------------------------------------------------------
-
-          app_gradle = root / "app/build.gradle"
-          text = app_gradle.read_text()
-
-          old_app_id = 'applicationId "com.voiceskip"'
-          new_app_id = 'applicationId "com.voiceskip.fold7"'
-
-          if old_app_id not in text:
-              raise SystemExit("Application ID anchor not found")
-
-          text = text.replace(old_app_id, new_app_id, 1)
-
-          old_version = 'versionName "1.0.7"'
-          new_version = 'versionName "1.0.7-fold7"'
-
-          if old_version not in text:
-              raise SystemExit("Version name anchor not found")
-
-          text = text.replace(old_version, new_version, 1)
-
-          if new_app_id not in text:
-              raise SystemExit("Application ID verification failed")
-
-          if new_version not in text:
-              raise SystemExit("Version verification failed")
-
-          app_gradle.write_text(text)
-
-          # ---------------------------------------------------------
-          # Visible app name + model label.
-          #
-          # We deliberately patch strings.xml, not Kotlin UI logic.
-          # With only one bundled Whisper model it is displayed as
-          # "Optimal for Fold7".
-          # ---------------------------------------------------------
-
-          strings = root / "app/src/main/res/values/strings.xml"
-          text = strings.read_text()
-
-          old_app_name = (
-              '<string name="app_name">VoiceSkip</string>'
-          )
-
-          new_app_name = (
-              '<string name="app_name">VoiceSkip Fold7</string>'
-          )
-
-          if old_app_name not in text:
-              raise SystemExit("App name anchor not found")
-
-          text = text.replace(
-              old_app_name,
-              new_app_name,
-              1
-          )
-
-          old_fast_label = (
-              '<string name="settings_model_faster">Faster</string>'
-          )
-
-          new_fast_label = (
-              '<string name="settings_model_faster">'
-              'Optimal for Fold7'
-              '</string>'
-          )
-
-          if old_fast_label not in text:
-              raise SystemExit("Model label string anchor not found")
-
-          text = text.replace(
-              old_fast_label,
-              new_fast_label,
-              1
-          )
-
-          if new_app_name not in text:
-              raise SystemExit("App name verification failed")
-
-          if "Optimal for Fold7" not in text:
-              raise SystemExit("Model label verification failed")
-
-          strings.write_text(text)
-
-          print("All Fold7 source patches applied and verified")
-
-          # Fold7 compatibility profile: set before ggml enumerates/initializes Vulkan.
-          jni = root / 'lib/src/main/jni/jni.c'
-          text = jni.read_text()
-          def replace_once(text, old, new):
-              if text.count(old) != 1:
-                  raise SystemExit('Patch anchor must occur once: ' + old[:100])
-              return text.replace(old, new, 1)
-          text = replace_once(text, '// #define EXTRA_LOGS', '#define EXTRA_LOGS')
-          text = replace_once(text, 'static jclass g_class_illegal_state;', '''/* Vulkan writes shader/driver failures to stderr, bypassing whisper_log_set.
-           * Route that stream into our own process log so the in-app report can retain it. */
-          static void *fold7_stderr_reader(void *opaque)
-          {
-              FILE *input = fdopen((int)(intptr_t)opaque, "r");
-              if (!input) { close((int)(intptr_t)opaque); return NULL; }
-              char line[1024];
-              while (fgets(line, sizeof line, input))
-                  __android_log_write(ANDROID_LOG_WARN, "Fold7Native", line);
-              fclose(input);
-              return NULL;
-          }
-
-          static void fold7_capture_stderr(void)
-          {
-              int fds[2];
-              if (pipe(fds) != 0) return;
-              pthread_t thread;
-              if (pthread_create(&thread, NULL, fold7_stderr_reader, (void *)(intptr_t)fds[0]) != 0)
-              {
-                  close(fds[0]); close(fds[1]); return;
-              }
-              pthread_detach(thread);
-              dup2(fds[1], STDERR_FILENO);
-              close(fds[1]);
-          }
-
-          static jclass g_class_illegal_state;''')
-          text = replace_once(text, '#include <stdatomic.h>', '#include <stdatomic.h>\n#include <stdint.h>')
-          text = replace_once(text, '    whisper_log_set(whisper_android_log_callback, NULL);', '''    /* Conservative profile for the Fold7 build, before Vulkan module loading.
-               * These are real runtime controls in pinned ggml, not unused CMake flags. */
-              setenv("GGML_VK_DISABLE_COOPMAT", "1", 1);
-              setenv("GGML_VK_DISABLE_COOPMAT2", "1", 1);
-              setenv("GGML_VK_DISABLE_F16", "1", 1);
-              setenv("GGML_VK_DISABLE_INTEGER_DOT_PRODUCT", "1", 1);
-              setenv("GGML_VK_DISABLE_FUSION", "1", 1);
-              setenv("GGML_VK_DISABLE_ASYNC", "1", 1);
-              fold7_capture_stderr();
-              whisper_log_set(whisper_android_log_callback, NULL);
-              LOGI("Fold7 compatibility-v2: FP32, no coopmat/int-dot/fusion/async/flash-attention");''')
-          text = replace_once(text, '    cparams.flash_attn = cparams.use_gpu = use_gpu;', '''    cparams.use_gpu = use_gpu;
-              cparams.flash_attn = false;''')
-          text = replace_once(text, 'whisper_full_default_params(WHISPER_SAMPLING_GREEDY);', 'whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH);')
-          text = replace_once(text, '    wparams.suppress_nst = true;', '''    wparams.suppress_nst = true;
-              wparams.beam_search.beam_size = 5;''')
-          jni.write_text(text)
-
-          # Respect the PCM format produced by MediaCodec, including format changes.
-          audio = root / 'app/src/main/java/com/voiceskip/media/FileAudioProvider.kt'
-          text = audio.read_text()
-          text = replace_once(text, 'import android.media.MediaCodec', 'import android.media.AudioFormat\nimport android.media.MediaCodec')
-          text = replace_once(text, '            var outputEOS = false', '''            var outputEOS = false
-                      var outputRate = trackInfo.sampleRate
-                      var outputChannels = trackInfo.channels
-                      var outputEncoding = AudioFormat.ENCODING_PCM_16BIT''')
-          text = replace_once(text, '                if (outputIndex >= 0) {', '''                if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                              val format = decoder!!.outputFormat
-                              outputRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-                              outputChannels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
-                              outputEncoding = if (format.containsKey(MediaFormat.KEY_PCM_ENCODING))
-                                  format.getInteger(MediaFormat.KEY_PCM_ENCODING)
-                              else AudioFormat.ENCODING_PCM_16BIT
-                              Log.i("Fold7Audio", "PCM rate=$outputRate channels=$outputChannels encoding=$outputEncoding")
-                          }
-                          if (outputIndex >= 0) {''')
-          text = replace_once(text, '                            outputBuffer.get(pcmData)', '''                            outputBuffer.position(inputBufferInfo.offset)
-                                      outputBuffer.limit(inputBufferInfo.offset + inputBufferInfo.size)
-                                      outputBuffer.get(pcmData)''')
-          text = replace_once(text, 'pcmData, trackInfo.channels, trackInfo.sampleRate', 'pcmData, outputChannels, outputRate, outputEncoding')
-          start = text.index('        sourceSampleRate: Int\n')
-          end = text.index('        return if (sourceSampleRate', start)
-          text = text[:start] + '''        sourceSampleRate: Int,
-                  encoding: Int
-              ): FloatArray {
-                  require(channels > 0 && sourceSampleRate > 0)
-                  val data = ByteBuffer.wrap(pcmData).order(ByteOrder.LITTLE_ENDIAN)
-                  val bytesPerSample = when (encoding) {
-                      AudioFormat.ENCODING_PCM_16BIT -> 2
-                      AudioFormat.ENCODING_PCM_FLOAT, AudioFormat.ENCODING_PCM_32BIT -> 4
-                      AudioFormat.ENCODING_PCM_24BIT_PACKED -> 3
-                      AudioFormat.ENCODING_PCM_8BIT -> 1
-                      else -> error("Unsupported PCM encoding: $encoding")
-                  }
-                  val monoSamples = FloatArray(pcmData.size / (bytesPerSample * channels)) {
-                      var sum = 0f
-                      repeat(channels) {
-                          val sample = when (encoding) {
-                              AudioFormat.ENCODING_PCM_FLOAT -> data.float
-                              AudioFormat.ENCODING_PCM_32BIT -> data.int / 2147483648f
-                              AudioFormat.ENCODING_PCM_24BIT_PACKED -> {
-                                  val value = (data.get().toInt() and 255) or
-                                      ((data.get().toInt() and 255) shl 8) or
-                                      (data.get().toInt() shl 16)
-                                  value / 8388608f
-                              }
-                              AudioFormat.ENCODING_PCM_8BIT -> ((data.get().toInt() and 255) - 128) / 128f
-                              else -> data.short / 32768f
-                          }
-                          sum += if (sample.isFinite()) sample.coerceIn(-1f, 1f) else 0f
-                      }
-                      sum / channels
-                  }
-
-          ''' + text[end:]
-          text = replace_once(text, '    private fun convertPcmToFloat(', '    internal fun convertPcmToFloat(')
-          audio.write_text(text)
-
-          test = root / 'app/src/test/java/com/voiceskip/media/Fold7PcmTest.kt'
-          test.parent.mkdir(parents=True, exist_ok=True)
-          test.write_text('''package com.voiceskip.media
-
-          import android.media.AudioFormat
-          import java.io.File
-          import java.nio.ByteBuffer
-          import java.nio.ByteOrder
-          import org.junit.Assert.assertArrayEquals
-          import org.junit.Test
-
-          class Fold7PcmTest {
-              private val provider = FileAudioProvider(file = File("unused-test-input"))
-
-              @Test fun floatStereoIsNotInterpretedAsInt16() {
-                  val data = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
-                      .putFloat(0.5f).putFloat(0.25f).putFloat(-1f).putFloat(1f).array()
-                  assertArrayEquals(floatArrayOf(0.375f, 0f),
-                      provider.convertPcmToFloat(data, 2, 16000, AudioFormat.ENCODING_PCM_FLOAT), 0.00001f)
-              }
-
-              @Test fun int16PreservesFullNegativeRange() {
-                  val data = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-                      .putShort((-32768).toShort()).putShort(16384.toShort()).array()
-                  assertArrayEquals(floatArrayOf(-1f, 0.5f),
-                      provider.convertPcmToFloat(data, 1, 16000, AudioFormat.ENCODING_PCM_16BIT), 0.00001f)
-              }
-
-              @Test fun packed24BitSignIsPreserved() {
-                  val data = byteArrayOf(0, 0, 0x80.toByte(), 0, 0, 0x40)
-                  assertArrayEquals(floatArrayOf(-1f, 0.5f),
-                      provider.convertPcmToFloat(data, 1, 16000, AudioFormat.ENCODING_PCM_24BIT_PACKED), 0.00001f)
-              }
-
-              @Test fun invalidFloatSamplesCannotPoisonModel() {
-                  val data = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-                      .putFloat(Float.NaN).putFloat(Float.POSITIVE_INFINITY).array()
-                  assertArrayEquals(floatArrayOf(0f, 0f),
-                      provider.convertPcmToFloat(data, 1, 16000, AudioFormat.ENCODING_PCM_FLOAT), 0f)
-              }
-          }
-          ''')
-
-          app_gradle = root / 'app/build.gradle'
-          text = app_gradle.read_text().replace('versionCode 20', 'versionCode 21').replace('1.0.7-fold7"', '1.0.7-fold7-compat2"')
-          app_gradle.write_text(text)
-          # CI's old debug signing key was ephemeral. Install alongside the old app
-          # so testing never requires deleting the user's recordings or settings.
-          text = app_gradle.read_text().replace('applicationId "com.voiceskip.fold7"', 'applicationId "com.voiceskip.fold7.compat2"')
-          app_gradle.write_text(text)
-          strings = root / 'app/src/main/res/values/strings.xml'
-          strings.write_text(strings.read_text().replace('>VoiceSkip Fold7</string>', '>VoiceSkip Fold7 2</string>'))
-
-          diagnostics = root / 'app/src/main/java/com/voiceskip/ui/settings/Fold7Diagnostics.kt'
-          diagnostics.write_text('''package com.voiceskip.ui.settings
-
-          import android.os.Build
-          import android.os.Process
-          import androidx.activity.compose.rememberLauncherForActivityResult
-          import androidx.activity.result.contract.ActivityResultContracts
-          import androidx.compose.foundation.layout.*
-          import androidx.compose.foundation.rememberScrollState
-          import androidx.compose.foundation.verticalScroll
-          import androidx.compose.material3.*
-          import androidx.compose.runtime.*
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.platform.LocalContext
-          import com.voiceskip.BuildConfig
-          import kotlinx.coroutines.Dispatchers
-          import kotlinx.coroutines.launch
-          import kotlinx.coroutines.withContext
-          import java.util.concurrent.TimeUnit
-
-          @Composable
-          fun Fold7Diagnostics() {
-              val context = LocalContext.current
-              val scope = rememberCoroutineScope()
-              var report by remember { mutableStateOf<String?>(null) }
-              var busy by remember { mutableStateOf(false) }
-              var status by remember { mutableStateOf("") }
-              val save = rememberLauncherForActivityResult(
-                  ActivityResultContracts.CreateDocument("text/plain")
-              ) { uri ->
-                  val text = report
-                  if (uri != null && text != null) scope.launch {
-                      status = withContext(Dispatchers.IO) {
-                          runCatching {
-                              requireNotNull(context.contentResolver.openOutputStream(uri)).bufferedWriter().use { it.write(text) }
-                              "Отчёт сохранён"
-                          }.getOrElse { "Не удалось сохранить отчёт: ${it.javaClass.simpleName}" }
-                      }
-                  }
-              }
-              TextButton(enabled = !busy, onClick = {
-                  busy = true
-                  scope.launch {
-                      report = withContext(Dispatchers.IO) {
-                          val header = "VoiceSkip ${BuildConfig.VERSION_NAME}\\n" +
-                              "${Build.MANUFACTURER} ${Build.MODEL}; Android ${Build.VERSION.RELEASE}; ${Build.HARDWARE}\\n" +
-                              "Profile: Vulkan FP32; flash/coopmat/int-dot/fusion/async disabled; beam=5\\n"
-                          header + runCatching {
-                              val log = java.lang.ProcessBuilder("logcat", "-d", "-t", "1200", "--pid=${Process.myPid()}",
-                                  "-v", "brief", "JNI:I", "whisper_guard:V", "whisper:V", "ggml:V", "Fold7Native:V", "Fold7Audio:I", "*:S")
-                                  .redirectErrorStream(true).start()
-                              // Drain while the process runs, with a bounded wait on a separate watchdog.
-                              val watchdog = Thread {
-                                  if (!log.waitFor(4, TimeUnit.SECONDS)) log.destroy()
-                              }.apply { isDaemon = true; start() }
-                              val lines = log.inputStream.bufferedReader().use { it.readText().takeLast(48000) }
-                              watchdog.join(4500)
-                              // Keep engine status/errors only; never include transcription text.
-                              lines.lineSequence().filter { line ->
-                                  listOf("GPU", "gpu", "Vulkan", "vulkan", "exception", "failed", "Failed",
-                                      "error", "Error", "backend", "buffer", "memory", "Starting stream", "PCM rate", "compatibility-v2")
-                                      .any { line.contains(it) }
-                              }.map { it.replace(Regex("/[^\\\\s]+"), "[path]") }
-                                  .take(160).joinToString("\\n").ifBlank { "Нет записей движка. Повторите ошибку и откройте отчёт в этом же сеансе." }
-                          }.getOrElse { "Не удалось прочитать журнал: ${it.javaClass.simpleName}" }
-                      }
-                      busy = false
-                  }
-              }) { Text(if (busy) "Подготовка отчёта…" else "Диагностика GPU и звука") }
-              if (status.isNotEmpty()) Text(status)
-              report?.let { text ->
-                  AlertDialog(onDismissRequest = { report = null },
-                      title = { Text("Диагностика Fold7") },
-                      text = { Text(text, modifier = Modifier.verticalScroll(rememberScrollState())) },
-                      confirmButton = { TextButton(onClick = { save.launch("VoiceSkip-Fold7-diagnostics.txt") }) { Text("Сохранить файл") } },
-                      dismissButton = { TextButton(onClick = { report = null }) { Text("Закрыть") } })
-              }
-          }
-          ''')
-          about = root / 'app/src/main/java/com/voiceskip/ui/settings/AboutSection.kt'
-          text = about.read_text()
-          text = replace_once(text, '            AboutItemMultiline(', '            Fold7Diagnostics()\n\n            AboutItemMultiline(')
-          about.write_text(text)
-
-      - name: Native Vulkan build preflight
-        working-directory: source
-        run: |
-          set -euo pipefail
-
-          chmod +x gradlew
-
-          ./gradlew \
-            --no-daemon \
-            --stacktrace \
-            -PtargetAbi=arm64-v8a \
-            :lib:assembleDebug
-
-          find lib/build \
-            -type f \
-            \( \
-              -name "libggml-vulkan.so" \
-              -o -name "libwhisper.so" \
-            \) \
-            -print
-
-          test -n "$(
-            find lib/build \
-              -type f \
-              -name "libggml-vulkan.so" \
-              -print \
-              -quit
-          )"
-
-          test -n "$(
-            find lib/build \
-              -type f \
-              -name "libwhisper.so" \
-              -print \
-              -quit
-          )"
-
-          echo "Native Vulkan build preflight OK"
-
-      - name: Install pinned Large-v3-turbo q5_0 model
-        run: |
-          set -euo pipefail
-
-          MODEL_DIR="source/models_pack/src/main/assets/models"
-          MODEL="$MODEL_DIR/$MODEL_FILE"
-
-          rm -f "$MODEL_DIR"/ggml-base-*.bin
-          rm -f "$MODEL_DIR"/ggml-small-*.bin
-          rm -f "$MODEL_DIR"/ggml-medium-*.bin
-          rm -f "$MODEL_DIR"/ggml-large-*.bin
-
-          curl -L \
-            --fail \
-            --retry 5 \
-            --retry-delay 5 \
-            -o "$MODEL" \
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/$MODEL_HF_COMMIT/$MODEL_FILE"
-
-          test -s "$MODEL"
-
-          ACTUAL_MODEL_SIZE="$(stat -c%s "$MODEL")"
-
-          echo "Expected model size: $MODEL_SIZE"
-          echo "Actual model size:   $ACTUAL_MODEL_SIZE"
-
-          test "$ACTUAL_MODEL_SIZE" = "$MODEL_SIZE"
-
-          echo "$MODEL_SHA256  $MODEL" | sha256sum -c -
-
-          echo "Installed models:"
-          ls -lh "$MODEL_DIR"
-
-      - name: Run JVM tests
-        working-directory: source
-        run: ./gradlew --no-daemon -PtargetAbi=arm64-v8a :app:testDebugUnitTest
-
-      - name: Build Fold7 arm64 APK
-        working-directory: source
-        run: |
-          set -euo pipefail
-
-          ./gradlew \
-            --no-daemon \
-            --stacktrace \
-            -PtargetAbi=arm64-v8a \
-            assembleDebug
-
-      - name: Verify and stage APK
-        run: |
-          set -euo pipefail
-
-          mkdir -p out
-
-          APK="$(
-            find source/app/build/outputs/apk/debug \
-              -type f \
-              -name "*.apk" \
-              -print \
-              -quit
-          )"
-
-          test -n "$APK"
-          test -s "$APK"
-
-          echo "Built APK:"
-          ls -lh "$APK"
-
-          echo "Checking Large-v3-turbo model..."
-          unzip -l "$APK" \
-            | grep -F "assets/models/$MODEL_FILE"
-
-          echo "Checking Silero VAD..."
-          unzip -l "$APK" \
-            | grep -F "assets/models/$VAD_FILE"
-
-          echo "Checking Vulkan backend..."
-          unzip -l "$APK" \
-            | grep -F "lib/arm64-v8a/libggml-vulkan.so"
-
-          echo "Checking Whisper native library..."
-          unzip -l "$APK" \
-            | grep -F "lib/arm64-v8a/libwhisper.so"
-
-          echo "Checking no weak bundled Whisper models remain..."
-
-          if unzip -l "$APK" \
-            | grep -E \
-              'assets/models/ggml-(base|small|medium)-'; then
-            echo "Unexpected weaker Whisper model found in APK"
-            exit 1
-          fi
-
-          FINAL="out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk"
-
-          cp "$APK" "$FINAL"
-
-          sha256sum "$FINAL" > "$FINAL.sha256"
-
-          echo "Final APK:"
-          ls -lh "$FINAL" "$FINAL.sha256"
-
-          echo "APK SHA256:"
-          cat "$FINAL.sha256"
-
-      - name: Upload APK
+          p=Path('deliverable/VoiceSkip-Fold7-GigaAM.apk')
+          with zipfile.ZipFile(p) as z:
+              manifest=json.loads(z.read('assets/models/manifest.json'))
+              assert len(manifest)==6
+              for row in manifest:
+                  data=z.read('assets/models/'+row['name'])
+                  assert len(data)==row['size']
+                  assert hashlib.sha256(data).hexdigest()==row['sha256']
+              libs=[n for n in z.namelist() if n.endswith('.so')]
+              assert libs and all(n.startswith('lib/arm64-v8a/') for n in libs)
+              assert not any('whisper' in n.lower() or 'vulkan' in n.lower() for n in z.namelist())
+              for name in libs:
+                  data=z.read(name); assert data[4]==2
+                  phoff=struct.unpack_from('<Q',data,32)[0]
+                  entsize,num=struct.unpack_from('<HH',data,54)
+                  for i in range(num):
+                      fields=struct.unpack_from('<IIQQQQQQ',data,phoff+i*entsize)
+                      if fields[0]==1: assert fields[-1]>=16384,(name,fields[-1])
+          Path('deliverable/SHA256.txt').write_text(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n')
+          PY
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose deliverable/VoiceSkip-Fold7-GigaAM.apk
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 deliverable/VoiceSkip-Fold7-GigaAM.apk > deliverable/alignment.txt
+      - name: Build Android runtime tests
+        working-directory: court
+        run: gradle --no-daemon -PemulatorTest :app:assembleDebug :app:assembleDebugAndroidTest
+      - name: Allow emulator acceleration
+        run: sudo chmod 666 /dev/kvm
+      - name: Test native ASR, real diarization, decode, persistence and UI on Android
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          profile: pixel_2
+          ram-size: 4096M
+          heap-size: 1024M
+          disk-size: 8G
+          disable-animations: true
+          script: |
+            adb install court/app/build/outputs/apk/debug/app-debug.apk
+            adb install court/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            adb shell am instrument -w com.voiceskip.fold7.court.test/androidx.test.runner.AndroidJUnitRunner > deliverable/android-tests.txt
+            cat deliverable/android-tests.txt
+            grep -q 'OK (1 test)' deliverable/android-tests.txt
+            adb shell am start -n com.voiceskip.fold7.court/.MainActivity
+            adb shell pm grant com.voiceskip.fold7.court android.permission.POST_NOTIFICATIONS
+            adb shell screencap -p /sdcard/court.png
+            adb pull /sdcard/court.png deliverable/android-screen.png
+      - name: Upload verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: VoiceSkip-Fold7-APK
+          name: VoiceSkip-Fold7-GigaAM-APK
+          path: deliverable/
+          compression-level: 0
+          retention-days: 90
+      - name: Upload source and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-and-tests
           path: |
-            out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk
-            out/VoiceSkip-Fold7-Large-v3-Turbo-Adreno830.apk.sha256
-          retention-days: 30
+            court/app/src/main/java/
+            court/app/build/reports/
+            court/provenance.json
+            deliverable/android-tests.txt
