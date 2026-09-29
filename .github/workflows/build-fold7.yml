@@ -67,6 +67,10 @@ jobs:
         run: gradle --no-daemon -PemulatorTest :app:assembleDebug :app:assembleDebugAndroidTest
       - name: Allow emulator acceleration
         run: sudo chmod 666 /dev/kvm
+      - name: Fetch and verify real Gemma for the Android legal-text test
+        run: |
+          curl -fL --retry 3 -o gemma.litertlm https://huggingface.co/litert-community/gemma-4-E4B-it-litert-lm/resolve/2eee7ac325f20eb8c9ac1d0e972f7c84663062da/gemma-4-E4B-it.litertlm
+          echo '0b2a8980ce155fd97673d8e820b4d29d9c7d99b8fa6806f425d969b145bd52e0  gemma.litertlm' | sha256sum -c -
       - name: Test native ASR, real diarization, decode, persistence and UI on Android
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -74,16 +78,18 @@ jobs:
           arch: x86_64
           target: google_apis
           profile: pixel_2
-          ram-size: 4096M
+          ram-size: 6144M
           heap-size: 1024M
-          disk-size: 8G
+          disk-size: 12G
           disable-animations: true
           script: |
             adb install court/app/build/outputs/apk/debug/app-debug.apk
             adb install court/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            adb shell run-as com.voiceskip.fold7.court mkdir -p files/gemma4
+            adb shell run-as com.voiceskip.fold7.court sh -c '"cat > files/gemma4/gemma4-e4b.litertlm"' < gemma.litertlm
             adb shell am instrument -w com.voiceskip.fold7.court.test/androidx.test.runner.AndroidJUnitRunner > deliverable/android-tests.txt
             cat deliverable/android-tests.txt
-            grep -q 'OK (1 test)' deliverable/android-tests.txt
+            grep -q 'OK (2 tests)' deliverable/android-tests.txt
             adb shell am start -n com.voiceskip.fold7.court/.MainActivity
             adb shell pm grant com.voiceskip.fold7.court android.permission.POST_NOTIFICATIONS
             adb shell screencap -p /sdcard/court.png
