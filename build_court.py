@@ -103,7 +103,8 @@ class GemmaDeviceTest {
     val source="уважаемый суд я не признаю иск Иванов требует 12000 рублей прошу приобщить договор к материалам дела"
     Engine(EngineConfig(model.absolutePath,backend=Backend.CPU(threadCount=2),maxNumTokens=4096,cacheDir=context.cacheDir.absolutePath)).use{engine->
         engine.initialize()
-        val result=engine.createConversation(ConversationConfig(systemInstruction=Contents.of(LegalGuard.PROMPT),samplerConfig=SamplerConfig(1,1.0,0.0),maxOutputToken=500,thinkingConfig=ThinkingConfig(false))).use{it.sendMessage("<реплика>\n$source\n</реплика>").toString().trim()}
+        val response=engine.createConversation(ConversationConfig(systemInstruction=Contents.of(LegalGuard.PROMPT),samplerConfig=SamplerConfig(1,1.0,0.0),maxOutputToken=500,thinkingConfig=ThinkingConfig(false))).use{it.sendMessage("<реплика>\n$source\n</реплика>").toString().trim()}
+        val result=LegalGuard.restoreNumberFormatting(source,response)
         assertTrue("Gemma changed evidence: $result",LegalGuard.accepts(source,result))
         assertTrue("Gemma must add punctuation: $result",result.any{it=='.'||it==','})
         assertTrue(result.contains("12000"))
@@ -233,6 +234,16 @@ object Audio {
 
 /** A court transcript is evidence: a fluent substitution is still a substitution. */
 object LegalGuard {
+    /** Restore spacing only when the complete ordered numeric sequence is unchanged. */
+    fun restoreNumberFormatting(original:String,edited:String):String {
+        val pattern=Regex("(?<![\\p{L}\\p{N}])[+−-]?\\d+(?:[ \\u00a0\\u202f]\\d{3})*(?:[.,:/-]\\d+)*")
+        val source=pattern.findAll(original).toList();val target=pattern.findAll(edited).toList()
+        fun canonical(s:String)=s.replace(Regex("[ \\u00a0\\u202f]"),"")
+        if(source.size!=target.size || source.indices.any{canonical(source[it].value)!=canonical(target[it].value)})return edited
+        var result=edited
+        for(i in target.indices.reversed())result=result.replaceRange(target[i].range,source[i].value)
+        return result
+    }
     private fun words(text:String)=Regex("[\\p{L}\\p{N}]+").findAll(text).map{it.value.lowercase(java.util.Locale.ROOT)}.toList()
     private fun numbers(text:String)=Regex("(?<![\\p{L}\\p{N}])[+−-]?\\d+(?:[.,:/-]\\d+)*").findAll(text).map{it.value}.toList()
     private fun markers(text:String)=Regex("\\[[^\\]]*\\]|[№%₽$€=]").findAll(text).map{it.value}.toList()
@@ -321,7 +332,8 @@ class LocalEditor(private val context:Context) {
                 if(engine==null){JobState.status="Загрузка Gemma · локальная редактура";engine=Engine(EngineConfig(model.absolutePath,backend=Backend.CPU(threadCount=2),maxNumTokens=4096,cacheDir=File(context.cacheDir,"gemma").also{it.mkdirs()}.absolutePath));engine.initialize()}
                 JobState.status="Gemma · русский юридический текст · ${i+1}/${session.blocks.size}"
                 val block=session.blocks[i]
-                val edited=engine.createConversation(ConversationConfig(systemInstruction=Contents.of(LegalGuard.PROMPT),samplerConfig=SamplerConfig(1,1.0,0.0),maxOutputToken=1800,thinkingConfig=ThinkingConfig(false))).use{it.sendMessage("<реплика>\n${block.text}\n</реплика>").toString().trim()}
+                val response=engine.createConversation(ConversationConfig(systemInstruction=Contents.of(LegalGuard.PROMPT),samplerConfig=SamplerConfig(1,1.0,0.0),maxOutputToken=1800,thinkingConfig=ThinkingConfig(false))).use{it.sendMessage("<реплика>\n${block.text}\n</реплика>").toString().trim()}
+                val edited=LegalGuard.restoreNumberFormatting(block.text,response)
                 checkCancelled()
                 if(LegalGuard.accepts(block.text,edited))block.text=edited else session.review.add(i)
                 session.editedUntil=i+1;session.save(context)
@@ -828,6 +840,12 @@ class LegalGuardTest {
     assertFalse(LegalGuard.accepts("остаток -12000 рублей", "Остаток 12000 рублей."))
     assertFalse(LegalGuard.accepts("ставка 12%", "Ставка 12."))
     assertFalse(LegalGuard.accepts("сказал [неразборчиво]", "Сказал неразборчиво."))
+ }
+ @Test fun restoresOnlyEquivalentNumericFormatting(){
+    assertEquals("Иванов требует 12000 рублей.",LegalGuard.restoreNumberFormatting("Иванов требует 12000 рублей","Иванов требует 12 000 рублей."))
+    assertFalse(LegalGuard.accepts("сумма 12000",LegalGuard.restoreNumberFormatting("сумма 12000","Сумма 13 000.")))
+    assertFalse(LegalGuard.accepts("числа 12 34",LegalGuard.restoreNumberFormatting("числа 12 34","Числа 1234.")))
+    assertEquals("Сумма 12000000.",LegalGuard.restoreNumberFormatting("сумма 12000000","Сумма 12\u202f000\u202f000."))
  }
 }
 ''',
