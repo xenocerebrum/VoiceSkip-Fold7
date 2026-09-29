@@ -20,10 +20,10 @@ android {
     }
     buildTypes { getByName("release") { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("debug") } }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
-    kotlinOptions { jvmTarget = "17" }
     androidResources { noCompress += listOf("onnx", "bin") }
     packaging { jniLibs { useLegacyPackaging = false } }
 }
+kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
 dependencies {
     implementation(files("libs/sherpa.aar"))
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.17.1")
@@ -445,6 +445,7 @@ class MainActivity: Activity() {
         }
     }
     private fun edit(index:Int) {
+        if(JobState.busy){showError("Дождитесь завершения обработки или остановите её перед правкой.");return}
         val s=session?:return;val b=s.blocks[index]
         val panel=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(24,8,24,8)}
         val speaker=Spinner(this);val ids=(s.blocks.map{it.speaker}+listOf(-1)).distinct().sorted()
@@ -454,6 +455,7 @@ class MainActivity: Activity() {
         AlertDialog.Builder(this).setTitle("Исправить реплику").setView(panel).setNegativeButton("Отмена",null).setPositiveButton("Сохранить"){_,_->b.text=field.text.toString();b.speaker=ids[speaker.selectedItemPosition];s.save(this);render()}.show()
     }
     private fun rename(id:Int) {
+        if(JobState.busy){showError("Дождитесь завершения обработки или остановите её перед правкой.");return}
         val s=session?:return;val field=EditText(this).apply{setText(s.name(id));selectAll()}
         AlertDialog.Builder(this).setTitle("Имя или роль говорящего").setMessage("Например: судья, истец, представитель. Применяется ко всем репликам этого говорящего.").setView(field).setNegativeButton("Отмена",null).setPositiveButton("Сохранить"){_,_->val name=field.text.toString().trim();if(name.isNotEmpty()){s.names[id]=name;s.save(this);render()}}.show()
     }
@@ -640,7 +642,10 @@ object Transcript {
             val body = buildString {
                 append(p("Расшифровка судебного заседания", true))
                 append(p("Автоматическая расшифровка аудиозаписи. Не является официальным протоколом."))
-                blocks.forEach { append(p(name(it.speaker), true)); append(p(it.text)) }
+                blocks.forEach { block ->
+                    append(p(name(block.speaker), true))
+                    block.text.lines().filter { it.isNotBlank() }.forEach { append(p(it)) }
+                }
             }
             entry("word/document.xml", """<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>$body<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1701"/></w:sectPr></w:body></w:document>""")
         }
