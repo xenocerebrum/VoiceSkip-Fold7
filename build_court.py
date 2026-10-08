@@ -354,6 +354,7 @@ import android.media.*
 import android.net.Uri
 import android.os.*
 import android.provider.OpenableColumns
+import android.provider.DocumentsContract
 import android.graphics.Color
 import android.view.*
 import android.widget.*
@@ -371,6 +372,9 @@ class MainActivity: Activity() {
     private var lastBusy=false
     private var playing=false
     private var player:AudioTrack?=null
+    private val audioRequest=10
+    private val exportRequest=20
+    private val folderRequest=30
     private val refresh=object:Runnable {
         override fun run() {
             status.text=JobState.status
@@ -379,7 +383,7 @@ class MainActivity: Activity() {
             record.text=if(JobState.recording)"Остановить и расшифровать" else "Записать заседание"
             if(lastBusy && !JobState.busy) {
                 val file=File(filesDir,"sessions/${JobState.sessionId}.json")
-                if(file.exists()){session=Session.load(file);render()}
+                if(file.exists()){session=Session.load(file);autoSaveIfConfigured(session!!);render()}
                 else if(JobState.status.startsWith("Ошибка")) showError(JobState.status)
             }
             lastBusy=JobState.busy;handler.postDelayed(this,700)
@@ -394,14 +398,14 @@ class MainActivity: Activity() {
         title("VoiceSkip Fold7",25)
         title("GigaAM + Gemma 4 · спикеры · русский язык",13)
         status=title(JobState.status,15)
-        open=button(root,"Открыть аудиозапись") { startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("audio/*").addCategory(Intent.CATEGORY_OPENABLE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION),10) }
+        open=button(root,"Новая расшифровка: выбрать аудиозапись") { chooseAudio() }
         record=button(root,"Записать заседание") {
             if(JobState.recording)startService(Intent(this,TranscriptionService::class.java).setAction("stop-record"))
             else if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED)requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO),11)
             else startRecording()
         }
         val toolbar=LinearLayout(this);root.addView(toolbar)
-        button(toolbar,"Записи") { history() };button(toolbar,"Экспорт") { exportMenu() };button(toolbar,"Ещё") { more() }
+        button(toolbar,"Записи") { history() };button(toolbar,"Сохранить") { exportMenu() };button(toolbar,"Меню") { more() }
         val scroll=ScrollView(this);root.addView(scroll,LinearLayout.LayoutParams(-1,0,1f))
         rows=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL};scroll.addView(rows)
         session=Session.files(this).firstOrNull()?.let{runCatching{Session.load(it)}.getOrNull()}
@@ -412,6 +416,7 @@ class MainActivity: Activity() {
             if(uri!=null && !JobState.busy)startFile(uri)
         }
     }
+    private fun chooseAudio() = startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).setType("audio/*").addCategory(Intent.CATEGORY_OPENABLE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION),audioRequest)
     override fun onResume(){super.onResume();handler.post(refresh)}
     override fun onPause(){handler.removeCallbacks(refresh);super.onPause()}
     override fun onDestroy(){stopPlayback();super.onDestroy()}
@@ -428,8 +433,16 @@ class MainActivity: Activity() {
         super.onActivityResult(requestCode,resultCode,data)
         if(resultCode!=RESULT_OK)return
         val uri=data?.data?:return
-        if(requestCode==10){runCatching{contentResolver.takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION)};startFile(uri)}
-        if(requestCode==20)try {
+        if(requestCode==audioRequest){runCatching{contentResolver.takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION)};startFile(uri)}
+        if(requestCode==folderRequest) {
+            try {
+                contentResolver.takePersistableUriPermission(uri,Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+                getSharedPreferences("voiceSkip",MODE_PRIVATE).edit().putString("exportTree",uri.toString()).apply()
+                Toast.makeText(this,"Папка сохранения выбрана. Готовые расшифровки будут сохраняться туда автоматически.",Toast.LENGTH_LONG).show()
+                session?.let { autoSaveIfConfigured(it) }
+            } catch(e:Exception) { showError("Не удалось выбрать папку: ${e.message}") }
+        }
+        if(requestCode==exportRequest)try {
             contentResolver.openOutputStream(uri)?.use{out ->
                 when(exportKind){
                     "docx" -> {val s=session?:error("Нет текста");Transcript.docx(out,s.blocks,s::name)}
@@ -440,6 +453,21 @@ class MainActivity: Activity() {
             }?:error("Не удалось открыть файл")
             Toast.makeText(this,"Файл сохранён",Toast.LENGTH_LONG).show()
         }catch(e:Exception){showError("Не удалось сохранить: ${e.message}")}
+    }
+    private fun autoSaveIfConfigured(s:Session) {
+        if(!s.complete || s.autoExported || JobState.busy) return
+        val raw=getSharedPreferences("voiceSkip",MODE_PRIVATE).getString("exportTree",null)?:return
+        Thread {
+            try {
+                val tree=Uri.parse(raw);val id=DocumentsContract.getTreeDocumentId(tree)
+                val parent=DocumentsContract.buildDocumentUriUsingTree(tree,id)
+                val name="Расшифровка-${s.id}.docx"
+                val document=DocumentsContract.createDocument(contentResolver,parent,"application/vnd.openxmlformats-officedocument.wordprocessingml.document",name)?:error("Папка недоступна")
+                contentResolver.openOutputStream(document)?.use{Transcript.docx(it,s.blocks,s::name)}?:error("Не удалось открыть файл")
+                s.autoExported=true;s.save(this)
+                runOnUiThread{Toast.makeText(this,"DOCX автоматически сохранён в выбранную папку",Toast.LENGTH_LONG).show()}
+            } catch(e:Exception) { runOnUiThread{showError("Автосохранение не выполнено: ${e.message}")} }
+        }.start()
     }
     private fun render() {
         rows.removeAllViews();val s=session
@@ -475,15 +503,20 @@ class MainActivity: Activity() {
     }
     private fun history() {
         val files=Session.files(this);val sessions=files.mapNotNull{runCatching{Session.load(it)}.getOrNull()}
-        AlertDialog.Builder(this).setTitle("Сохранённые записи").setItems(sessions.map{it.title}.toTypedArray()){_,i->session=sessions[i];stopPlayback();render()}.setNegativeButton("Закрыть",null).show()
+        AlertDialog.Builder(this).setTitle("Сохранённые расшифровки").setItems(sessions.map{it.title+(if(it.complete)"" else " · обработка не завершена")}.toTypedArray()){_,i->session=sessions[i];stopPlayback();render()}.setNegativeButton("Новая запись"){_,_->chooseAudio()}.setNeutralButton("Закрыть",null).show()
     }
     private fun exportMenu(){if(session==null){showError("Сначала расшифруйте запись");return};AlertDialog.Builder(this).setTitle("Сохранить файл").setItems(arrayOf("Документ Word (.docx)","Текст со спикерами (.txt)","Исходное распознавание (.txt)")){_,i->export(arrayOf("docx","txt","raw")[i])}.show()}
     private fun export(kind:String) {
         exportKind=kind
         val filename=if(kind=="log")"VoiceSkip-diagnostics.txt" else "Расшифровка-${session?.id}.${if(kind=="docx")"docx" else "txt"}"
-        startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType(if(kind=="docx")"application/vnd.openxmlformats-officedocument.wordprocessingml.document" else "text/plain").putExtra(Intent.EXTRA_TITLE,filename),20)
+        startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType(if(kind=="docx")"application/vnd.openxmlformats-officedocument.wordprocessingml.document" else "text/plain").putExtra(Intent.EXTRA_TITLE,filename),exportRequest)
     }
-    private fun more(){AlertDialog.Builder(this).setItems(arrayOf("Остановить обработку","Остановить прослушивание","Экспорт ошибки","О приложении",if(JobState.paused)"Продолжить обработку" else "Пауза после реплики")){_,i->when(i){0->JobState.cancel=true;1->stopPlayback();2->export("log");3->AlertDialog.Builder(this).setTitle("VoiceSkip Fold7 GigaAM").setMessage("GigaAM v3 E2E RNNT • sherpa-onnx 1.13.8\nPyannote 3.0 + 3D-Speaker\n\nGemma 4 E4B редактирует пунктуацию и абзацы русского юридического текста. Изменения слов и чисел отклоняются. Юридические факты не дописываются. Фамилии, числа и распределение реплик следует сверить с записью. Нажмите на имя для переименования, на текст — для правки.\n\nGigaAM и спикеры находятся в APK. Gemma (3,7 ГБ) автоматически загружается один раз при первой обработке; затем всё работает без интернета. Аудио и текст никуда не отправляются.\n\n"+assets.open("NOTICE.txt").bufferedReader().use{it.readText()}).setPositiveButton("Закрыть",null).show();4->JobState.paused=!JobState.paused}}.show()}
+    private fun more(){AlertDialog.Builder(this).setTitle("Меню").setItems(arrayOf("Выбрать папку для автосохранения DOCX","Открыть аудиозапись","Записать заседание","Остановить обработку","Остановить прослушивание","Экспорт ошибки","О приложении",if(JobState.paused)"Продолжить обработку" else "Пауза после реплики")){_,i->when(i){
+        0->startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION),folderRequest)
+        1->chooseAudio();2->record.performClick();3->JobState.cancel=true;4->stopPlayback();5->export("log")
+        6->AlertDialog.Builder(this).setTitle("VoiceSkip Fold7 GigaAM").setMessage("GigaAM v3 E2E RNNT · Pyannote 3.0 · 3D-Speaker\n\nРеплики помечаются стабильными номерами Говорящий 1, 2, 3. Нажмите на номер, чтобы присвоить имя; на текст — чтобы исправить его. Gemma меняет только пунктуацию и разбивку абзацев. Исходная запись и исходное распознавание сохраняются для сверки.\n\nПосле выбора папки готовый DOCX сохраняется туда автоматически. Аудио и текст никуда не отправляются.\n\n"+assets.open("NOTICE.txt").bufferedReader().use{it.readText()}).setPositiveButton("Закрыть",null).show()
+        7->JobState.paused=!JobState.paused
+    }}.show()}
     private fun showError(message:String){AlertDialog.Builder(this).setTitle("VoiceSkip Fold7").setMessage(message).setPositiveButton("Закрыть",null).show()}
     private fun stopPlayback(){playing=false;runCatching{player?.pause()};player=null}
     private fun play(start:Float) {
@@ -557,11 +590,12 @@ class Session(val id: String, var title: String, var complete: Boolean=false,
               val blocks: MutableList<Block> = mutableListOf(), val names: MutableMap<Int,String> = mutableMapOf(), var raw: String="") {
     var editedUntil=0
     var diarized=false
+    var autoExported=false
     val review=mutableListOf<Int>()
-    fun name(id: Int) = names[id] ?: if(id<0) "Говорящий не определён" else "Говорящий ${id+1}"
+    fun name(id: Int) = names[id] ?: if(id<0) "Неопределённый фрагмент" else "Говорящий ${id+1}"
     fun save(context: Context) {
         val j=JSONObject().put("id",id).put("title",title).put("complete",complete).put("raw",raw)
-        j.put("editedUntil",editedUntil).put("diarized",diarized).put("review",JSONArray(review))
+        j.put("editedUntil",editedUntil).put("diarized",diarized).put("autoExported",autoExported).put("review",JSONArray(review))
         j.put("blocks",JSONArray().also { a -> blocks.forEach { a.put(JSONObject().put("start",it.start).put("speaker",it.speaker).put("text",it.text)) } })
         j.put("names",JSONObject().also { o -> names.forEach { (k,v)->o.put(k.toString(),v) } })
         val dir=File(context.filesDir,"sessions").also { it.mkdirs() };val tmp=File(dir,"$id.tmp")
@@ -570,7 +604,7 @@ class Session(val id: String, var title: String, var complete: Boolean=false,
     companion object {
         fun load(file: File): Session {
             val j=JSONObject(file.readText());val s=Session(j.getString("id"),j.getString("title"),j.getBoolean("complete"),raw=j.getString("raw"))
-            s.editedUntil=j.optInt("editedUntil");s.diarized=j.optBoolean("diarized")
+            s.editedUntil=j.optInt("editedUntil");s.diarized=j.optBoolean("diarized");s.autoExported=j.optBoolean("autoExported")
             j.optJSONArray("review")?.let{a->for(i in 0 until a.length())s.review.add(a.getInt(i))}
             val a=j.getJSONArray("blocks");for(i in 0 until a.length()){val b=a.getJSONObject(i);s.blocks.add(Block(b.getDouble("start").toFloat(),b.getInt("speaker"),b.getString("text")))}
             val n=j.getJSONObject("names");n.keys().forEach { s.names[it.toInt()]=n.getString(it) };return s
@@ -601,6 +635,27 @@ data class Word(val start: Float, val end: Float, val text: String)
 data class Block(val start: Float, var speaker: Int, var text: String)
 
 object Transcript {
+    fun normalizeTurns(turns: List<Turn>): List<Turn> {
+        if(turns.isEmpty()) return emptyList()
+        val duration=turns.groupBy { it.speaker }.mapValues { (_, rows) -> rows.sumOf { (it.end-it.start).toDouble() }.toFloat() }
+        val all=duration.values.sum()
+        // A room recording often produces tiny one-off clusters from rustling or
+        // overlapping syllables. They are not useful speaker identities. Keep
+        // substantial voices and join the fragments to their nearest substantial
+        // speech interval. We do not impose a fixed number of speakers.
+        val keep=duration.filterValues { it >= maxOf(7.5f, all*.025f) }.keys
+        if(keep.isEmpty()) return turns
+        val stable=turns.filter { it.speaker in keep }
+        return turns.map { turn ->
+            if(turn.speaker in keep) turn else turn.copy(speaker=stable.minByOrNull { candidate ->
+                when {
+                    turn.end < candidate.start -> candidate.start-turn.end
+                    turn.start > candidate.end -> turn.start-candidate.end
+                    else -> 0f
+                }
+            }!!.speaker)
+        }
+    }
     fun words(tokens: Array<String>, times: FloatArray, offset: Float, end: Float): List<Word> {
         require(tokens.size == times.size) { "Модель вернула неполные временные метки" }
         val out = mutableListOf<Word>()
@@ -619,6 +674,7 @@ object Transcript {
         return out
     }
     fun speaker(word: Word, turns: List<Turn>): Int {
+        if (turns.isEmpty()) return -1
         val duration = maxOf(.02f, word.end - word.start)
         val scores = turns.groupBy { it.speaker }.mapValues { (_, rows) ->
             // Union intervals prevents overlapping windows from inflating confidence.
@@ -628,9 +684,21 @@ object Transcript {
                 if (end > left) { total += end - left; right = end }
             }; total
         }.entries.sortedByDescending { it.value }
-        if (scores.isEmpty() || scores[0].value < duration * .65f) return -1
-        if (scores.size > 1 && scores[1].value > duration * .2f) return -1
-        return scores[0].key
+        val winner = scores.firstOrNull()?.takeIf { it.value > 0f }?.key
+        if (winner != null) return winner
+
+        // ASR word timestamps and diarization windows rarely share the exact
+        // boundary. Assign a nearby interval instead of turning the whole
+        // transcript into "unknown". This never invents a legal role: it only
+        // keeps the stable numeric speaker ID returned by diarization.
+        val middle = (word.start + word.end) / 2f
+        return turns.minByOrNull { turn ->
+            when {
+                middle < turn.start -> turn.start - middle
+                middle > turn.end -> middle - turn.end
+                else -> 0f
+            }
+        }?.speaker ?: -1
     }
     fun blocks(words: List<Word>, turns: List<Turn>): MutableList<Block> {
         val out = mutableListOf<Block>()
@@ -808,12 +876,13 @@ class TranscriptionService: Service() {
         val diarization=OfflineSpeakerDiarization(config=OfflineSpeakerDiarizationConfig(
             segmentation=OfflineSpeakerSegmentationModelConfig(pyannote=OfflineSpeakerSegmentationPyannoteModelConfig(model=path("segmentation.onnx")),numThreads=2),
             embedding=SpeakerEmbeddingExtractorConfig(model=path("embedding.onnx"),numThreads=2),
-            clustering=FastClusteringConfig(threshold=.9f),minDurationOn=.2f,minDurationOff=.5f))
+            clustering=FastClusteringConfig(numClusters=-1,threshold=.9f),minDurationOn=.28f,minDurationOff=.45f))
         val turns=try {diarization.processWithCallback(samples,{done,total,_ -> if(!JobState.cancel)waitForCooling();JobState.status="Разделение говорящих · ${done*100/maxOf(1,total)}%";if(JobState.cancel)1 else 0}).map { Turn(it.start,it.end,it.speaker) }} finally {diarization.release()}
         check(!JobState.cancel){"Обработка отменена"}
         // Stable labels follow the order of first speech, never inferred legal roles.
-        val ids=turns.sortedBy{it.start}.map{it.speaker}.distinct().withIndex().associate{it.value to it.index}
-        session.blocks.clear();session.blocks.addAll(Transcript.blocks(words,turns.map{it.copy(speaker=ids.getValue(it.speaker))}))
+        val normalized=Transcript.normalizeTurns(turns)
+        val ids=normalized.sortedBy{it.start}.map{it.speaker}.distinct().withIndex().associate{it.value to it.index}
+        session.blocks.clear();session.blocks.addAll(Transcript.blocks(words,normalized.map{it.copy(speaker=ids.getValue(it.speaker))}))
         session.diarized=true;session.save(this)
     }
     private fun waitForCooling() {
@@ -884,11 +953,20 @@ import java.util.zip.ZipInputStream
 import javax.xml.parsers.DocumentBuilderFactory
 
 class TranscriptTest {
- @Test fun overlapAndGapsAreUnknown() {
+ @Test fun choosesDominantIntervalAndMarksOnlyMissingDiarizationUnknown() {
   val w = Word(1f, 2f, "слово")
   assertEquals(-1, Transcript.speaker(w, emptyList()))
-  assertEquals(-1, Transcript.speaker(w, listOf(Turn(0f, 3f, 0), Turn(1.5f, 3f, 1))))
+  assertEquals(0, Transcript.speaker(w, listOf(Turn(0f, 3f, 0), Turn(1.5f, 3f, 1))))
   assertEquals(0, Transcript.speaker(w, listOf(Turn(0f, 3f, 0))))
+ }
+ @Test fun assignsNearestDiarizedSpeakerAtWindowBoundary() {
+  val w = Word(3.02f, 3.12f, "реплика")
+  assertEquals(1, Transcript.speaker(w, listOf(Turn(0f, 2.9f, 0), Turn(3.2f, 4f, 1))))
+ }
+ @Test fun foldsTinyNoiseClustersIntoNearbyRealSpeakers() {
+  val turns=Transcript.normalizeTurns(listOf(Turn(0f,20f,8),Turn(21f,22f,99),Turn(23f,40f,8),Turn(45f,60f,2)))
+  assertEquals(setOf(8,2),turns.map{it.speaker}.toSet())
+  assertEquals(8,turns[1].speaker)
  }
  @Test fun subwordsRetainLegalTokens() {
   val w = Transcript.words(arrayOf(" Не", " при", "з", "на", "ю", " 25", "."), floatArrayOf(0f,.1f,.2f,.3f,.4f,.6f,.7f),10f,11f)
